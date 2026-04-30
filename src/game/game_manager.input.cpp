@@ -3,42 +3,96 @@
 // todo: use hid and gip instead of xinput
 
 #include <Xinput.h>
+#include <atomic>
+#include <cstring>
+
+#include "../logging/logging.h"
+
+#include "../input/win32_input.h"
+#include "../main/main.h"
 
 using namespace libmcc;
 
-bool __fastcall c_game_manager::get_input_state(e_local_player player, s_input_state* state) {
+static bool xinput_query(e_local_player player, s_gamepad_state* gp) {
 	XINPUT_STATE xstate;
+	if (XInputGetState(player, &xstate) != ERROR_SUCCESS) return false;
+	gp->buttons       = xstate.Gamepad.wButtons;
+	gp->leftTrigger   = xstate.Gamepad.bLeftTrigger;
+	gp->rightTrigger  = xstate.Gamepad.bRightTrigger;
+	gp->thumbLX       = xstate.Gamepad.sThumbLX;
+	gp->thumbLY       = xstate.Gamepad.sThumbLY;
+	gp->thumbRX       = xstate.Gamepad.sThumbRX;
+	gp->thumbRY       = xstate.Gamepad.sThumbRY;
+	return true;
+}
 
+// Cheap "did this gamepad poll show user activity?" check. Used to flip
+// out of kbm-sticky mode only when there's real pad input — pad-connected
+// alone (idle sticks/buttons) shouldn't override mouse/keyboard.
+static bool gamepad_has_activity(const s_gamepad_state* gp) {
+	if ((int)gp->buttons != 0) return true;
+	if (gp->leftTrigger > 30 || gp->rightTrigger > 30) return true;
+	const int dz = 8000;  // XInput stick deadzone
+	if (gp->thumbLX > dz || gp->thumbLX < -dz) return true;
+	if (gp->thumbLY > dz || gp->thumbLY < -dz) return true;
+	if (gp->thumbRX > dz || gp->thumbRX < -dz) return true;
+	if (gp->thumbRY > dz || gp->thumbRY < -dz) return true;
+	return false;
+}
+
+bool __fastcall c_game_manager::get_input_state(e_local_player player, s_input_state* state) {
 	memset(state, 0, sizeof(*state));
 
-	if (XInputGetState(player, &xstate) == ERROR_SUCCESS) {
-		state->gamepad.buttons = xstate.Gamepad.wButtons;
-		state->gamepad.leftTrigger = xstate.Gamepad.bLeftTrigger;
-		state->gamepad.rightTrigger = xstate.Gamepad.bRightTrigger;
-		state->gamepad.thumbLX = xstate.Gamepad.sThumbLX;
-		state->gamepad.thumbLY = xstate.Gamepad.sThumbLY;
-		state->gamepad.thumbRX = xstate.Gamepad.sThumbRX;
-		state->gamepad.thumbRY = xstate.Gamepad.sThumbRY;
+	const bool has_pad = xinput_query(player, &state->gamepad);
+
+	if (player == _local_player_0) {
+		win32_input_snapshot(&state->keyboard, &state->mouse);
+
+		// Pause-overlay gate: while the halox imgui overlay is visible, the
+		// game must not see any KB/M input. Otherwise mouse motion drags the
+		// camera while the user is trying to click "Quit" and key presses
+		// (E/F/SPACE) leak into the game world. The OS cursor IS released
+		// (apply_cursor_capture(false)) but raw-input deltas keep flowing —
+		// gating here is the canonical fix.
+		if (g_show_imgui) {
+			std::memset(&state->keyboard, 0, sizeof(state->keyboard));
+			state->mouse.lX      = 0.0f;
+			state->mouse.lY      = 0.0f;
+			state->mouse.lZ      = 0.0f;
+			state->mouse.buttons = 0;
+		}
+
+		// is_km is sticky: once the user touches mouse/keyboard, stay in kbm
+		// mode until the gamepad shows real activity (sticks past deadzone or
+		// buttons/triggers pressed). This prevents the per-frame flicker that
+		// caused jumpy aim — a single still frame would otherwise flip the
+		// game back into pad-mode and discard our mouse delta.
+		const bool pad_active = has_pad && gamepad_has_activity(&state->gamepad);
+		if (pad_active) {
+			win32_input_clear_kbm_sticky();
+		}
+		const bool kbm_sticky = win32_input_kbm_sticky_active();
+		state->is_km = (kbm_sticky || !has_pad) ? 1 : 0;
+
+		// Diagnostic: per-100-call snapshot of the input-mode arbitration so
+		// we can verify which path (kbm vs pad) the engine is being told to
+		// use. Throttled so it doesn't flood at 60Hz.
+		static std::atomic<int> s_call{0};
+		int n = s_call.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n <= 4 || (n % 240) == 0) {
+			CONSOLE_LOG_INFO("input: get_input_state #%d has_pad=%d pad_active=%d kbm_sticky=%d → is_km=%d "
+				"(pad_buttons=0x%X mouse_buttons=0x%X)",
+				n, (int)has_pad, (int)pad_active, (int)kbm_sticky, (int)state->is_km,
+				(unsigned)state->gamepad.buttons, (unsigned)state->mouse.buttons);
+		}
 	}
 
 	return true;
 }
 
 bool __fastcall c_game_manager::get_input_state_gamepad(e_local_player player, s_input_state* state) {
-	XINPUT_STATE xstate;
-
 	memset(state, 0, sizeof(*state));
-
-	if (XInputGetState(player, &xstate) == ERROR_SUCCESS) {
-		state->gamepad.buttons = xstate.Gamepad.wButtons;
-		state->gamepad.leftTrigger = xstate.Gamepad.bLeftTrigger;
-		state->gamepad.rightTrigger = xstate.Gamepad.bRightTrigger;
-		state->gamepad.thumbLX = xstate.Gamepad.sThumbLX;
-		state->gamepad.thumbLY = xstate.Gamepad.sThumbLY;
-		state->gamepad.thumbRX = xstate.Gamepad.sThumbRX;
-		state->gamepad.thumbRY = xstate.Gamepad.sThumbRY;
-	}
-
+	xinput_query(player, &state->gamepad);
 	return true;
 }
 

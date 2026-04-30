@@ -12,10 +12,14 @@ public:
 	void warn(const char* fmt, ...);
 	void error(const char* file, int line, const char* fmt, ...);
 
+	void flush();
+
 	static c_console_logger g_console_logger;
 private:
 	const char* format(char* buffer, size_t size, const char* fmt, va_list args);
+	void write_line(const char* prefix, const char* str);
 	bool m_initialized = false;
+	FILE* m_log_file = nullptr;
 };
 
 inline c_console_logger* console_logger() {

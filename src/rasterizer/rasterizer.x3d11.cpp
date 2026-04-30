@@ -16,11 +16,13 @@ int c_rasterizer::initialize_device() {
 		return 1;
 	}
 
-	flags = 0
-#ifdef _DEBUG
-		| D3D11_CREATE_DEVICE_DEBUG
-#endif
-		;
+	// NOTE: D3D11_CREATE_DEVICE_DEBUG used to be enabled in _DEBUG builds, but
+	// the debug layer (D3D11_3SDKLayers.dll) raises a structured exception on
+	// validation errors, and several MCC game DLLs (halo1 in particular) make
+	// D3D calls that fail validation — turning into hard crashes instead of
+	// just log noise. We don't get validation value from inspecting game-side
+	// draws, so disable it across the board.
+	flags = 0;
 
 	constexpr std::array<D3D_FEATURE_LEVEL, 2> d3d_feature_levels{
 		D3D_FEATURE_LEVEL_11_0,

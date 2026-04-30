@@ -30,6 +30,11 @@ constexpr const char* k_game_names[]{
 };
 
 struct s_game_local {
+	// Absolute directory the variants below were enumerated from. Used by
+	// get_saved_game_file to load the right .bin / .mvar — populated by
+	// load_local. Empty == cwd-relative (legacy junction setup).
+	std::wstring             game_variant_dir;
+	std::wstring             map_variant_dir;
 	std::vector<std::string> hopper_game_variants;
 	std::vector<std::string> hopper_map_variants;
 	std::vector<std::string> films;
@@ -62,10 +67,23 @@ public:
 		LPARAM lParam);
 
 	int post_message(
-		libmcc::e_game_message message, 
+		libmcc::e_game_message message,
 		const libmcc::s_game_message_parameter* parameter = nullptr);
 
+	// Tear down the pause overlay AND resume the game engine. Used by every
+	// pause-menu button that closes the overlay — RESUME, REVERT, RESTART
+	// all need this. Without it the engine stays paused (since ESC is no
+	// longer the only path out) and queued actions like revert/restart
+	// never get processed by the per-tick pump.
+	void dismiss_pause_overlay();
+
 	int launch_game(const s_game_prop* prop);
+
+	// Worker-thread entry point. Called only by halox::ui::ui_launch_run_internal
+	// (the trampoline declared in game_instance_manager.win32.cpp). Drives the
+	// existing launch_game_internal() — exposed publicly only so the ui module
+	// doesn't need to befriend the manager.
+	int launch_game_internal_for_worker() { return launch_game_internal(); }
 
 	s_module_flags load_modules(s_module_flags);
 	s_module_flags unload_modules(s_module_flags);
@@ -100,6 +118,10 @@ public:
 
 	libmcc::e_module get_game() {
 		return m_game;
+	}
+
+	libmcc::e_game_mode get_mode() {
+		return m_game_options_storage.game_options.game_mode;
 	}
 
 	static c_game_instance_manager g_game_instance_manager;
