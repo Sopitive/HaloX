@@ -457,6 +457,126 @@ void halo1_call_preload_level_begin(void* engine, int map_index) {
 	CONSOLE_LOG_INFO("halo1_call_preload_level_begin: returned");
 }
 
+// halo1.dll's game thread halts at halo1+0xAD7D58 (0xBEEF0117) when
+// FUN_180AC49B8 evaluates `(DAT_182E3B9A0 != 0 && *DAT_182D91330 == 0)` true.
+//
+// 2026-04-30 watchpoint snoop of MCC's running halo 1 (PID 697044) showed
+// that DAT_182D91330, DAT_182BAA300, and DAT_182B259C0 stay NULL across an
+// entire halo 1 launch in MCC — only DAT_182E3B9A0 is written (by
+// initialize_game). MCC simply never reaches FUN_180AC49B8's halt path,
+// because its engine-driver code path (MCC+0x1F05F2 → halo1!initialize_game,
+// then a sequence of MCC functions that drive halo 1 directly) skips the
+// FUN_180AC2528 / FUN_180AAE97C / SYS::haloInit chain entirely.
+//
+// Halox previously tried to call FUN_180AC2528/FUN_18008C800/FUN_180AAE97C
+// to allocate the engine state — that triggered downstream AVs at
+// halo1+0xBF06E7 (FUN_180BF06C0 reading DAT_182BAA300+0x324B0) and others,
+// because those functions' downstream consumers want state that other
+// subsystems should set up. Halox doesn't run those subsystems — and
+// neither does MCC.
+//
+// Final approach: NOP the BEEF0117 halt-call so the engine thread can
+// continue past it (matching MCC's effective behavior — MCC never runs
+// the halt-call site at all), and stop trying to fake the SYS::haloInit
+// state. Whatever the engine thread really needs comes from MCC's
+// post-initialize_game driver loop, which we still need to discover.
+
+static constexpr uintptr_t k_h1_halt_call_rva       = 0xAC4A83;
+static constexpr size_t    k_h1_halt_call_size      = 5;
+static constexpr uintptr_t k_h1_launch_state_rva    = 0x2EA32F0;
+
+// FUN_1803bbe90 (the engine pump's per-tick body) opens with:
+//     test byte ptr [DAT_182e3c3e0], 4   ; F6 05 ?? ?? ?? ?? 04
+//     jne  <crash branch>                 ; 0F 85 ?? ?? ?? ??
+// The crash branch ends up calling FUN_180BF06C0 which AVs reading
+// DAT_182BAA300+0x324B0 (DAT_182BAA300 is NULL in halox's launcher path).
+// Live snoop of MCC's running halo 1 (PID 697044, 2026-04-30) showed
+// DAT_182E3C3E0 = 0 throughout — MCC always takes the safe branch.
+// Halox somehow has bit-2 set, sending the engine into the crash branch.
+//
+// Cheapest deterministic fix: patch the imm8 at halo1+0x3BBE9C from 0x04
+// to 0x00. With `test r/m8, 0` ZF is always set, so the following JNE
+// is never taken — engine always runs the MCC-equivalent path.
+static constexpr uintptr_t k_h1_pump_test_imm_rva = 0x3BBE9C;
+
+void halo1_call_engine_subsystem_init() {
+	static bool s_called = false;
+	if (s_called) return;
+
+	HMODULE h = GetModuleHandleW(L"halo1.dll");
+	if (h == nullptr) {
+		CONSOLE_LOG_WARN("halo1_call_engine_subsystem_init: halo1.dll not loaded — skipping");
+		return;
+	}
+	auto* h_base = reinterpret_cast<uint8_t*>(h);
+
+	auto* halt_call = h_base + k_h1_halt_call_rva;
+	if (halt_call[0] == 0xE8) {
+		DWORD old_prot = 0;
+		if (VirtualProtect(halt_call, k_h1_halt_call_size, PAGE_EXECUTE_READWRITE, &old_prot)) {
+			for (size_t i = 0; i < k_h1_halt_call_size; ++i) halt_call[i] = 0x90;
+			DWORD restore_prot = 0;
+			VirtualProtect(halt_call, k_h1_halt_call_size, old_prot, &restore_prot);
+			FlushInstructionCache(GetCurrentProcess(), halt_call, k_h1_halt_call_size);
+			CONSOLE_LOG_INFO("halo1_call_engine_subsystem_init: NOP'd BEEF0117 halt call @ halo1+0x%llX",
+				(unsigned long long)k_h1_halt_call_rva);
+		}
+	} else if (halt_call[0] == 0x90) {
+		CONSOLE_LOG_INFO("halo1_call_engine_subsystem_init: halt call already NOP'd");
+	} else {
+		CONSOLE_LOG_WARN("halo1_call_engine_subsystem_init: unexpected byte 0x%02X at halo1+0x%llX",
+			halt_call[0], (unsigned long long)k_h1_halt_call_rva);
+	}
+
+	// Force the external-launch state machine to "complete" (state 0xC).
+	// FUN_180B27184 is a state machine keyed on (int)DAT_182EA32F0. State 1
+	// calls FUN_180B26820 → FUN_180BF06C0 which AVs reading uninitialized
+	// DAT_182BAA300+0x324B0 in halox's launcher path. State 0xC ("done")
+	// makes FUN_180B27184 a no-op — its body's if/else-if chain bypasses
+	// every state action when state is 0xC, so the crash chain never runs.
+	// MCC has DAT_182EA32F0 = 0 in normal halo 1 because it never reaches
+	// FUN_180B27184 at all (its callers' gate `*DAT_182D91330 == 0` AV's
+	// in MCC because MCC has DAT_182D91330 = NULL, but execution never
+	// reaches that gate either). Halox does reach the gate with a non-NULL
+	// DAT_182D91330, so the safest patch is to force the state machine
+	// itself to be a no-op.
+	auto* state_slot = reinterpret_cast<int*>(h_base + k_h1_launch_state_rva);
+	{
+		DWORD old_prot = 0;
+		if (VirtualProtect(state_slot, sizeof(int), PAGE_READWRITE, &old_prot)) {
+			int prev = *state_slot;
+			*state_slot = 0xC;
+			DWORD restore_prot = 0;
+			VirtualProtect(state_slot, sizeof(int), old_prot, &restore_prot);
+			CONSOLE_LOG_INFO("halo1_call_engine_subsystem_init: stamped DAT_182EA32F0=0xC (was %d) — launch state machine forced complete",
+				prev);
+		}
+	}
+
+	// Patch the FUN_1803bbe90 pump-test imm8 from 4 to 0 so the engine
+	// always takes the MCC-equivalent safe branch and never enters the
+	// FUN_180BF06C0 / FUN_180AC2528 crash chain.
+	auto* pump_imm = h_base + k_h1_pump_test_imm_rva;
+	if (pump_imm[0] == 0x04) {
+		DWORD old_prot = 0;
+		if (VirtualProtect(pump_imm, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
+			pump_imm[0] = 0x00;
+			DWORD restore_prot = 0;
+			VirtualProtect(pump_imm, 1, old_prot, &restore_prot);
+			FlushInstructionCache(GetCurrentProcess(), pump_imm, 1);
+			CONSOLE_LOG_INFO("halo1_call_engine_subsystem_init: patched FUN_1803bbe90 test-imm to 0 @ halo1+0x%llX",
+				(unsigned long long)k_h1_pump_test_imm_rva);
+		}
+	} else if (pump_imm[0] == 0x00) {
+		CONSOLE_LOG_INFO("halo1_call_engine_subsystem_init: pump test-imm already patched");
+	} else {
+		CONSOLE_LOG_WARN("halo1_call_engine_subsystem_init: unexpected byte 0x%02X at halo1+0x%llX (want 0x04)",
+			pump_imm[0], (unsigned long long)k_h1_pump_test_imm_rva);
+	}
+
+	s_called = true;
+}
+
 // --- Heap-only vtable swap on RT instances -----------------------------------
 //
 // See halo1_native_overrides.h for the full rationale. Short version:
@@ -505,14 +625,185 @@ static s_swapped_vt_entry g_swapped_vts[k_max_unique_vts] = {};
 static int                g_swapped_vt_count = 0;
 static SRWLOCK            g_swapped_vt_lock = SRWLOCK_INIT;
 
+// Real d3d11 resource we hand back from the overridden slots. Live RE in MCC
+// (halo1 running) showed the value stored in halo1's RT subresource tables is
+// a pointer to a real d3d11 COM object — its first 8 bytes are a vtable in
+// d3d11.dll (verified via *(*(RT+0xE8)) → 0x000001FFBD1930F0 → first qword
+// 0x00007FFC2E3107F8, in d3d11.dll's range). Our previous stub returned a
+// fake C++ object with no d3d11 vtable; that leaked into d3d11's command
+// processor and AV'd at d3d11+0x10074D. Returning a real ID3D11Texture2D
+// (which IS-A ID3D11Resource) keeps d3d11's hazard checks walking valid
+// memory.
+static ID3D11Texture2D*          g_halo1_stub_texture = nullptr;
+static ID3D11ShaderResourceView* g_halo1_stub_srv     = nullptr;
+static ID3D11RenderTargetView*   g_halo1_stub_rtv     = nullptr;
+
+void halo1_init_stub_d3d11_resource(ID3D11Device* device) {
+	if (g_halo1_stub_texture) return; // idempotent
+	if (!device) return;
+
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width  = 4;
+	desc.Height = 4;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.Usage  = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+	HRESULT hr = device->CreateTexture2D(&desc, nullptr, &g_halo1_stub_texture);
+	if (FAILED(hr) || !g_halo1_stub_texture) {
+		CONSOLE_LOG_WARN("halo1 stub d3d11 resource: CreateTexture2D failed hr=0x%08lX", hr);
+		return;
+	}
+	hr = device->CreateShaderResourceView(g_halo1_stub_texture, nullptr, &g_halo1_stub_srv);
+	if (FAILED(hr)) {
+		CONSOLE_LOG_WARN("halo1 stub d3d11 resource: CreateShaderResourceView failed hr=0x%08lX", hr);
+	}
+	hr = device->CreateRenderTargetView(g_halo1_stub_texture, nullptr, &g_halo1_stub_rtv);
+	if (FAILED(hr)) {
+		CONSOLE_LOG_WARN("halo1 stub d3d11 resource: CreateRenderTargetView failed hr=0x%08lX", hr);
+	}
+	CONSOLE_LOG_INFO("halo1 stub d3d11 resource: tex=%p srv=%p rtv=%p",
+		(void*)g_halo1_stub_texture, (void*)g_halo1_stub_srv, (void*)g_halo1_stub_rtv);
+}
+
 // RT-class slot overrides. Engine calls `(this->vt[0xD0/8])(this, idx)` for
 // the GetSubResource accessor and `(this->vt[0xD8/8])(this, face, mip, ?)`
-// for GetMipSubResource. We return a pointer to our stub object in both
-// cases so the downstream `vt[1](result)` AddRef call doesn't AV.
-static void* stub_rt_get_subresource(void* /*self*/, int /*idx*/) {
+// for GetMipSubResource. The two slots feed DIFFERENT d3d11 paths:
+//
+//   slot 0x1A (vt[0xD0], GetSubResource): result fed to PSSetShaderResources
+//     and hazard tracking — needs ID3D11ShaderResourceView*.
+//
+//   slot 0x1B (vt[0xD8], GetMipSubResource): result placed into a 4-element
+//     RT array which FUN_180205E40 hands to a wrapper around OMSetRenderTargets
+//     (`vt[0x108] on param_1[0x19c]`, called as `(num, RT_array, depth)`).
+//     d3d11's OMSetRenderTargets expects ID3D11RenderTargetView*.
+//
+// Strategy: chain to original ONLY when the RT looks initialized (its +0xE8
+// d3d11 resource pointer is non-null). Broken RTs (the ones that AV'd in the
+// original FUN_1800AE410 path) have +0xE8 = NULL and get our 4x4 stub. Init'd
+// RTs return their real ID3D11SRV/RTV so world rendering goes to actual
+// textures instead of our 4x4.
+//
+// The original vtable back-pointer is stashed at copy[k_orig_vt_backptr_slot]
+// during get_or_create_vt_copy — no per-call lookup needed.
+//
+// The chained call is wrapped in:
+//   1) c_exception_log_suppressor — silences the vectored first-chance
+//      exception handler so its dbghelp walk doesn't corrupt under concurrent
+//      AV firings from many game threads.
+//   2) __try / __except (EXCEPTION_EXECUTE_HANDLER) — locally catches AVs
+//      from chain calls into partially-init halo1 internals so we can fall
+//      back to the 4x4 stub.
+// MSVC forbids mixing C++ object unwinding with SEH in one function, so
+// the SEH-wrapping helpers are written without C++ destructors and the
+// suppressor RAII lives in a parent C++ function.
+static constexpr int k_orig_vt_backptr_slot = 255;
+
+// Gate for the chain-to-original. The AV in halox was at FUN_18022b7b0+0x6F:
+//
+//   mov rax, [rax+0xE8]            ; lVar1 = *(ctx+0xE8)
+//   ...
+//   movsx r9d, byte [r11+0x1A]     ; face_count = (signed char) *(this+0x1A)
+//   ...
+//   mov rax, [rax + rcx*8]         ; ← AV here
+//
+// The final index uses face_count as a signed char. On a partially-init RT
+// where +0x1A is uninit (often 0xFF), face_count sign-extends to -1, the
+// computed index is hugely negative, and the read AVs. MCC live capture
+// (2026-04-30) showed face_count is 1 (2D RT) or 6 (cubemap) on valid RTs.
+//
+// Safe-call predicate:
+//   (a) +0x1A must be a sane positive face count (1 or 6).
+//   (b) The d3d11 resource array pointer at +0xE8 (face=0) or +0xF8 (face!=0)
+//       must be non-null. In MCC, RT_manager+0x1D0 bit 15 is clear, so
+//       FUN_1800ad5f0 returns `this` itself — the deref is on `this` directly.
+//       In halox we make the same assumption (defensive — if the manager
+//       bits are different, we miss valid RTs but don't break broken ones).
+static inline bool rt_safe_to_chain_subres(void* self) {
+	if (!self) return false;
+	auto p = reinterpret_cast<uintptr_t>(self);
+	int8_t face_count = *reinterpret_cast<int8_t*>(p + 0x1A);
+	if (face_count != 1 && face_count != 6) return false;
+	void* arr = *reinterpret_cast<void**>(p + 0xE8);
+	return arr != nullptr;
+}
+static inline bool rt_safe_to_chain_mip(void* self, int face) {
+	if (!self) return false;
+	auto p = reinterpret_cast<uintptr_t>(self);
+	int8_t face_count = *reinterpret_cast<int8_t*>(p + 0x1A);
+	if (face_count != 1 && face_count != 6) return false;
+	uintptr_t off = (face == 0) ? 0xE8 : 0xF8;
+	void* arr = *reinterpret_cast<void**>(p + off);
+	return arr != nullptr;
+}
+
+static inline void** orig_vt_from_self(void* self) {
+	void** my_vt = *reinterpret_cast<void***>(self);
+	return reinterpret_cast<void**>(my_vt[k_orig_vt_backptr_slot]);
+}
+
+// SEH-wrapping helpers — no C++ objects with destructors allowed in these.
+static void* try_call_orig_subresource(void* fn, void* self, int idx) {
+	using Fn = void* (__fastcall*)(void*, int);
+	void* result = nullptr;
+	__try {
+		result = reinterpret_cast<Fn>(fn)(self, idx);
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		result = nullptr;
+	}
+	return result;
+}
+// FUN_18022b7b0 (halo1's RT get_mip_subresource) is a 5-arg function: the 5th
+// arg is a signed int the engine writes at [rsp+0x20] before the call (stored
+// at [rsp+0x28] from the callee's view). Live RE confirmed it as a sign-ext
+// byte from the caller's `[r15+0x43]`. The function uses arg5 as part of an
+// index calculation: ecx = arg5 * face_count + R9 + R8, then loads from
+// `[table + rcx*8]`. Forwarding through a 4-arg typedef leaves [rsp+0x28] as
+// stack garbage, the index computes to a bogus value, and the original
+// returns a pointer into halo1's internal heap-globals region instead of a
+// real subresource — the engine then does `vt[AddRef]` on that and AVs at
+// halo1+0x2D26540 (.data BSS, NX violation).
+static void* try_call_orig_mip_subresource(void* fn, void* self, int face, int mip, int samples, int arg5) {
+	using Fn = void* (__fastcall*)(void*, int, int, int, int);
+	void* result = nullptr;
+	__try {
+		result = reinterpret_cast<Fn>(fn)(self, face, mip, samples, arg5);
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		result = nullptr;
+	}
+	return result;
+}
+
+// Engine's per-store AddRef at halo1+0xAE635 is NO LONGER NOP'd, so each
+// stored result gets a +1 refcount automatically. We just return — caller
+// AddRefs us, and the destructor's Release per stored entry then balances.
+static void* stub_rt_get_subresource(void* self, int idx) {
+	if (rt_safe_to_chain_subres(self)) {
+		void** orig = orig_vt_from_self(self);
+		if (orig && orig[0x1A]) {
+			c_exception_log_suppressor suppress;
+			void* result = try_call_orig_subresource(orig[0x1A], self, idx);
+			if (result) return result;
+		}
+	}
+	if (g_halo1_stub_srv)     return g_halo1_stub_srv;
+	if (g_halo1_stub_texture) return g_halo1_stub_texture;
 	return &g_stub_subresource;
 }
-static void* stub_rt_get_mip_subresource(void* /*self*/, int /*face*/, int /*mip*/, int /*samples*/) {
+static void* stub_rt_get_mip_subresource(void* self, int face, int mip, int samples, int arg5) {
+	if (rt_safe_to_chain_mip(self, face)) {
+		void** orig = orig_vt_from_self(self);
+		if (orig && orig[0x1B]) {
+			c_exception_log_suppressor suppress;
+			void* result = try_call_orig_mip_subresource(orig[0x1B], self, face, mip, samples, arg5);
+			if (result) return result;
+		}
+	}
+	if (g_halo1_stub_rtv)     return g_halo1_stub_rtv;
+	if (g_halo1_stub_texture) return g_halo1_stub_texture;
 	return &g_stub_subresource;
 }
 
@@ -561,6 +852,7 @@ static void** get_or_create_vt_copy(void* original_vt) {
 	memcpy(copy, original_vt, copy_bytes);
 	copy[0x1A] = reinterpret_cast<void*>(&stub_rt_get_subresource);    // offset 0xD0
 	copy[0x1B] = reinterpret_cast<void*>(&stub_rt_get_mip_subresource); // offset 0xD8
+	copy[k_orig_vt_backptr_slot] = original_vt; // back-pointer for chain-to-original
 
 	g_swapped_vts[g_swapped_vt_count++] = { original_vt, copy };
 	int idx = g_swapped_vt_count - 1;

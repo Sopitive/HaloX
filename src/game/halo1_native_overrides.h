@@ -67,6 +67,19 @@ void halo1_call_preload_common_begin(void* engine, void* device);
 // Pure virtual call, no hooks.
 void halo1_call_preload_level_begin(void* engine, int map_index);
 
+// Run halo1's "SYS::haloInit" engine-subsystem initializer by directly calling
+// FUN_180AC2528 (RVA 0xAC2528). This is the wrapper that allocates the
+// 0x1F10-byte engine-state block at DAT_182D91330 and runs Session command
+// handler installation + ~30 subsystem inits. Without this, the game thread
+// halts at halo1+0xAD7D58 with code 0xBEEF0117 because the precondition
+// `*DAT_182D91330 != 0` is never satisfied. MCC drives this via a tag-name
+// dispatcher that fires "SYS::haloInit"; halox calls the underlying function
+// directly. One-shot guarded internally.
+//
+// Call BEFORE game_engine->initialize_game (which is what flips DAT_182E3B9A0
+// to non-zero and sets up the halt condition).
+void halo1_call_engine_subsystem_init();
+
 // --- Heap-only vtable swap on RT instances ---
 //
 // halo1's FUN_1800AE410 (InitializeRenderTargets) does:
@@ -96,6 +109,16 @@ int halo1_swap_rt_vtables_once();
 // for up to 5s. Run alongside the game-init thread to catch RT entries the
 // instant they appear in the manager. Idempotent — repeated calls are no-ops.
 void halo1_start_rt_vtable_swap_poller();
+
+// Create the real ID3D11Texture2D + SRV that the RT vtable swap stubs return.
+// Halo1's normal init populates its RT subresource tables with real d3d11
+// resource pointers; our stubs need to return the same KIND of object (a real
+// d3d11 COM object, not a fake C++ stub) or d3d11's command processor crashes
+// deep in its internals when it tries to walk the SRV. Idempotent. Must be
+// called BEFORE halo1_start_rt_vtable_swap_poller() so the stubs have a real
+// resource to hand back.
+struct ID3D11Device;
+void halo1_init_stub_d3d11_resource(ID3D11Device* device);
 
 // Runtime byte-patch in halo1.dll's loaded image: NOP out the
 // `mov rdx, [rax]; call [rdx+8]` pair at halo1+0xAE635..0xAE63A. The CALL is

@@ -84,28 +84,23 @@ void __fastcall render_call_detour(uintptr_t param_1, uintptr_t param_2) {
 			(unsigned long long)field_vt, (int)vt_ok);
 	}
 
-	// If the dereference chain is unsafe, don't make the call — log + skip.
-	// The function's own guard is `param_1[8] < param_1[0xc]`; if we skip,
-	// we still need to clear those counters the way the original does so
-	// the next frame's progress isn't stuck. Mimic the post-call writes:
-	//   *(param_1 + 8) = *(param_1 + 0x10);
-	//   *(param_1 + 0xc) = 0;
+	// LOG-ONLY MODE (Anniversary diagnostic): we no longer suppress the call
+	// when the chain looks bad. The original launch-time AV only fired with
+	// a specific stale-pointer pattern that's been worked around elsewhere;
+	// the suppression path was killing legitimate Anniversary draws (whose
+	// vtable layout is similar but valid) and producing a world-less HUD-
+	// only render. Now we always defer to the engine and just record the
+	// pointer state so we can correlate with what's visible. If a real AV
+	// resurfaces, the unhandled-exception filter still catches it.
 	if (!param_2_ok || !field_ok || !vt_ok) {
 		const int skipped = g_render_call_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
 		if (skipped <= 4 || (skipped % 64) == 0) {
-			CONSOLE_LOG_WARN("h2_d3d_trace: SKIPPING FUN_180103290 call#%d (skip#%d) — would AV",
-				n, skipped);
+			CONSOLE_LOG_WARN("h2_d3d_trace: WOULD-SKIP FUN_180103290 call#%d "
+				"(would-skip#%d, p2_ok=%d field_ok=%d vt_ok=%d) — "
+				"calling engine anyway (Anniversary diagnostic)",
+				n, skipped, (int)param_2_ok, (int)field_ok, (int)vt_ok);
 		}
-		// Apply the function's tail-effect ourselves so callers don't loop.
-		if (ptr_is_readable(reinterpret_cast<void*>(param_1 + 0x10), 4)) {
-			uint32_t v10 = *reinterpret_cast<uint32_t*>(param_1 + 0x10);
-			*reinterpret_cast<uint32_t*>(param_1 + 8)  = v10;
-			*reinterpret_cast<uint32_t*>(param_1 + 0xc) = 0;
-		}
-		return;
 	}
-
-	// Pointer chain looks valid; defer to the original.
 	if (g_render_call_orig) {
 		g_render_call_orig(param_1, param_2);
 	}

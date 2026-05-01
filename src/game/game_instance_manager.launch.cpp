@@ -2,6 +2,7 @@
 
 #include "halo1_native_overrides.h"
 #include "halo2_d3d11_trace.h"
+#include "halo4_native_overrides.h"
 #include "haloreach_native_overrides.h"
 #include "../network/engine_context_shim.h"
 #include "../network/engine_context_logger.h"
@@ -160,6 +161,61 @@ int c_game_instance_manager::launch_game_internal() {
 		return -12;
 	}
 
+	// Secondary engine init for halo2 → groundhog (Anniversary visuals).
+	//
+	// halo2.dll handles the classic renderer + HUD; groundhog.dll is the H2A
+	// renderer that handles the Anniversary world view. MCC's launcher
+	// initializes BOTH when launching halo2 so the user can toggle visuals
+	// at runtime (H key in our config). halox previously only loaded
+	// groundhog's DLL (to read its data_access table for the multiplayer
+	// browser) and never called create_game_engine / initialize on it —
+	// resulting in halo2 toggling to Anniversary but seeing a black world
+	// because groundhog's render subsystem was never wired to the d3d11
+	// device.
+	//
+	// We mirror the primary engine's set_library_settings + create_game_engine
+	// + initialize(device, ctx, swap, nullptr) sequence on groundhog. We do
+	// NOT call initialize_game on it — only halo2 owns the game thread.
+	if (m_game == _module_halo2) {
+		auto* g_info = m_game_module_infos + _module_groundhog;
+		if (g_info->module_handle == nullptr) {
+			CONSOLE_LOG_WARN("launch_game_internal: groundhog module not loaded — Anniversary visuals will be blank");
+		} else {
+			FARPROC g_func = GetProcAddress(g_info->module_handle, EXPORT_FUNCTION_SET_LIBRARY_SETTINGS);
+			if (g_func) {
+				auto g_set_library_settings = reinterpret_cast<t_expf_set_library_settings>(g_func);
+				CONSOLE_LOG_INFO("launch_game_internal: secondary (groundhog) set_library_settings");
+				seh_call("groundhog set_library_settings", [&]{
+					g_set_library_settings(&language_settings);  // ignore return code (older-ABI ptr)
+				});
+			}
+			g_func = GetProcAddress(g_info->module_handle, EXPORT_FUNCTION_CREATE_GAME_ENGINE);
+			if (g_func == nullptr) {
+				CONSOLE_LOG_WARN("launch_game_internal: groundhog missing %s export — skipping secondary engine init",
+					EXPORT_FUNCTION_CREATE_GAME_ENGINE);
+			} else {
+				auto g_create_game_engine = reinterpret_cast<t_expf_create_game_engine>(g_func);
+				CONSOLE_LOG_INFO("launch_game_internal: secondary (groundhog) create_game_engine");
+				if (seh_call("groundhog create_game_engine", [&]{
+						g_create_game_engine(&m_game_engine_secondary);
+					})
+				    && m_game_engine_secondary != nullptr)
+				{
+					CONSOLE_LOG_INFO("launch_game_internal: secondary (groundhog) engine=%p — calling initialize",
+						m_game_engine_secondary);
+					seh_call("groundhog engine->initialize", [&]{
+						// Same shape as primary; nullptr 4th arg matches halo2/halo3+
+						// behavior (groundhog inherits halo3-style ABI).
+						m_game_engine_secondary->initialize(device, context, swapchain, nullptr);
+					});
+					CONSOLE_LOG_INFO("launch_game_internal: secondary (groundhog) initialize returned");
+				} else {
+					CONSOLE_LOG_WARN("launch_game_internal: groundhog create_game_engine failed or returned null — Anniversary will be blank");
+				}
+			}
+		}
+	}
+
 	// Slot 4 (PreloadCommonBegin) and slot 5 (PreloadLevelBegin) run AFTER
 	// slot 1 — they read the DAT_182e3bdd8 global that slot 1 just
 	// populated. Slot 5 takes a halo1-internal map index (not the libmcc
@@ -195,7 +251,19 @@ int c_game_instance_manager::launch_game_internal() {
 	// the function's tail-effect counter writes), and keeps the launch
 	// progressing so we can find the next downstream issue. See
 	// halo2_d3d11_trace.cpp.
-	if (m_game == _module_halo2) {
+	// 2026-05-01: trace is now disabled.  It logged + SUPPRESSED FUN_180103290
+	// calls when *(p2+0xd58) looked stale, which protected against the
+	// original launch-time AV at d3d11.dll+0x1059C5.  But the suppression
+	// path NOPs out a real d3d11 draw — and Anniversary graphics cycles
+	// objects through that vtable far more aggressively than classic, so
+	// some frames had legitimate draws killed → stutter + black flicker.
+	// The launch-time AV has been worked around elsewhere; leaving the
+	// trace on is now a net negative.
+	// 2026-05-01: trace turned off. Log-only diagnostic captured 944 calls
+	// across classic→anniversary→classic, all with valid pointer chains —
+	// disproving the +0xd58 hypothesis for the Anniversary world-render
+	// failure. The bug is elsewhere; trace is just log noise now.
+	if (false && m_game == _module_halo2) {
 		halo2_d3d11_trace_install();
 	}
 
@@ -211,18 +279,19 @@ int c_game_instance_manager::launch_game_internal() {
 	if (m_game == _module_halo1) {
 		halo1_install_engine_ctx_stub();
 		halo1_install_div_zero_fix();
-		// Register the named render targets (FUN_1800AE280). Walks
-		// PTR_DAT_181b85e60 and for each name calls insert-into-RT-manager
-		// then vt[0xA8] (FULL Create) which allocates the backing
-		// ID3D11Texture2D. WITHOUT this, FUN_1801F6FE0(rmgr, name) returns
-		// half-initialized RTs whose GetSubResource(0) yields an SRV with
-		// a non-existent ID3D11Resource — halo1 later binds that SRV via
-		// PSSetShaderResources and d3d11's hazard check (CContext::
-		// DoFineGrainedSRVOutputHazardCheck @ d3d11+0xFE640) AVs at
-		// d3d11+0x1155E4 trying to read [resource+0xE0]. Engine_ctx_stub
-		// must already be in place above (FUN_1800AE280 reads w/h from
-		// the descriptor at +0x118).
-		halo1_call_register_named_render_targets();
+		// 2026-04-30: pre-calling halo1+0xAE280 (RegisterNamedRenderTargets)
+		// reliably AVs inside FUN_1801f6fe0 (RT-array bubble-sort) at +0x1F700B.
+		// SEH catches it but halo1's RT manager is left in a half-sorted /
+		// half-initialized state — the next d3d11 commands from the game
+		// thread then crash inside d3d11.dll (~+0x10074D) because they read
+		// resources that never finished allocating. The RT vtable swap
+		// poller below redirects GetSubResource / GetMipSubResource to our
+		// stub for the symptoms this pre-call was guarding against, so
+		// skipping it lets halo1's natural init flow complete the sort
+		// without a torn pre-pass. If a later regression brings back the
+		// d3d11+0x1155E4 hazard-check AV, we'll need a different RT
+		// registration path that doesn't use FUN_1800AE280's sort.
+		// halo1_call_register_named_render_targets();  // intentionally disabled
 	}
 
 	// halo1: TWO complementary fixes for races/NULLs in FUN_1800AE410:
@@ -249,16 +318,45 @@ int c_game_instance_manager::launch_game_internal() {
 	// memory/project_halo1_render_config_crash.md.
 	if (m_game == _module_halo1) {
 		halo1_install_init_render_targets_spinwait();
-		halo1_install_rt_subresource_addref_nop();
-		// 2026-04-29: spinwait + addref-NOP get past +0xAE635 but a SEPARATE
-		// crash hits at halo1+0x22B81F inside vt[0x1B] = FUN_18022B7B0
-		// (GetMipSubResource). Even with pool A populated (spinwait reports
-		// "pool ready 0 iters"), this path dereferences another null pointer.
-		// The RT vtable swap poller overrides vt[0x1A]/vt[0x1B] on each RT
-		// instance to return our stub subresource — bypasses both
-		// GetSubResource and GetMipSubResource entirely. Already implemented;
-		// just needed to be wired into the launch flow.
+		// 2026-05-01: AddRef NOP at +0xAE635 disabled. The NOP was originally
+		// added because AddRef crashed on the engine's bad/NULL subresource
+		// returns. Now that our stubs always return real ID3D11* COM objects
+		// (and the spinwait ensures the orig-chain path also returns valid
+		// objects), the engine's natural per-store AddRef must run — without
+		// it, the engine stores N pointers without bumping refcount, then
+		// the destructor walks the table calling Release per entry and
+		// over-releases, AVing inside d3d11 (#0=heap, #1=d3d11+0xBD32,
+		// #2=halo1+0x22B24E in FUN_18022b0a0). See
+		// memory/project_halo1_spinwait_nop_validated.md for the full chain.
+		// halo1_install_rt_subresource_addref_nop();
+		// Path-B fix for the d3d11+0x10074D crash: create a real
+		// ID3D11Texture2D so the swap stubs return a valid d3d11 COM
+		// object instead of our fake C++ struct. Live RE in MCC showed
+		// halo1's normal init writes real ID3D11Resource* into these
+		// tables; d3d11's command processor walks them assuming real
+		// vtables — anything else AVs deep inside d3d11.
+		halo1_init_stub_d3d11_resource(device);
+		// 2026-04-30 evening: stub_rt_get_subresource / _mip_subresource
+		// now read the real *(self+0xE8) first and only fall back to the
+		// stub SRV/RTV when that pointer is NULL/junk. Real RTs render
+		// real; only the partially-init RTs (which would AV at +0x22B81F
+		// or +0xAE635 without a stub) get our 4x4 dummy.
 		halo1_start_rt_vtable_swap_poller();
+		// 2026-04-30: fire halo1's "SYS::haloInit" subsystem initializer
+		// (FUN_180AC2528 → FUN_180AAE97C) that allocates the engine-state
+		// block at DAT_182D91330 and runs Session command handlers + ~30
+		// other inits. Without it the game thread halts at halo1+0xAD7D58
+		// (0xBEEF0117) the moment it checks `*DAT_182D91330 != 0`. MCC
+		// drives this via a tag dispatcher; halox calls it directly.
+		// Must run BEFORE initialize_game (which sets DAT_182E3B9A0 and
+		// arms the halt precondition).
+		if (seh_call("halo1_call_engine_subsystem_init", [&]{
+			halo1_call_engine_subsystem_init();
+		})) {
+			CONSOLE_LOG_INFO("launch_game_internal: ran halo1 SYS::haloInit subsystem init");
+		} else {
+			CONSOLE_LOG_WARN("launch_game_internal: halo1 SYS::haloInit subsystem init SEH'd — proceeding anyway");
+		}
 	}
 
 	// Reach campaign: install the FUN_1802a41c4 (scenario-resolve+load) hook
@@ -286,6 +384,15 @@ int c_game_instance_manager::launch_game_internal() {
 		halox::network::engine_context_logger_install();
 	}
 
+	// halo4: guard FUN_1800785CC against null arg from the shared-scenario
+	// preload state machine. Caller (FUN_18003E230, case g_state == 1) passes
+	// a vfunc result that is null/unmapped because halox doesn't reproduce the
+	// MCC-side shared-tag preload. AV at halo4+0x78640 on `movups [rdi+0x10]`.
+	// The hook returns 0 on null/SEH; caller already handles 0 as a safe-exit.
+	if (m_game == _module_halo4) {
+		halo4_install_resource_register_guard();
+	}
+
 	CONSOLE_LOG_INFO("launch_game_internal: calling game_engine->initialize_game");
 	halox::ui::ui_launch_set_status("Loading %s — initialize_game (loading scenario)", game_name);
 	if (!seh_call("game_engine->initialize_game", [&]{
@@ -304,6 +411,23 @@ int c_game_instance_manager::launch_game_internal() {
 
 	CONSOLE_LOG_INFO("launch_game_internal: game thread started @ 0x%llX", (uint64_t)m_game_thread);
 	halox::ui::ui_launch_set_status("%s — game thread running", game_name);
+
+	// MCC's CoreSceneStateMachine_Update (mcc+0x1EFF34, state 11) immediately
+	// follows initialize_game with `engine->post_message(2, NULL)` and keeps
+	// firing it per frame as long as DAT_144000b9a != 0. halo1's vtable slot 3
+	// (post_message @ +0x93CE0) takes the generic path for msg_id=2: pop a
+	// free node from engine_ctx+0x440, stash msg_id, push to +0x430 — feeds
+	// the engine's event SLIST that the game thread drains. halox previously
+	// never sent this so the engine sat in its loaded-but-not-driving state.
+	// Send it once here as the kickoff; per-frame ticking is layer-2 work
+	// (would live alongside c_game_manager::begin_frame on the game thread).
+	if (m_game == _module_halo1) {
+		if (seh_call("post_message(halo1, msg_id=2)", [&]{
+			m_game_engine->post_message((libmcc::e_game_message)2, nullptr);
+		})) {
+			CONSOLE_LOG_INFO("launch_game_internal: posted halo1 kickoff message (msg_id=2)");
+		}
+	}
 
 	// Engine-context shim — patches g_game_manager's vtable in-place so
 	// haloreach's `(*g_engineContext)+0x148` (send) and `+0x158` (recv) route
@@ -424,6 +548,13 @@ int c_game_instance_manager::launch_game(const s_game_prop* prop) {
 		}
 		new (&m_game_options_storage.campaign_game_options) c_campaign_game_options();
 		game_options->difficulty_level = prop->difficulty;
+		// Skull bitmask + insertion point come from the launcher UI. The
+		// libmcc s_flags<uint64_t,e_skull>::bit_set helper uses (1 << pos)
+		// internally which overflows past bit 31, so stamp the raw uint64_t
+		// via the operator=(T) overload — it sets the underlying `n` field
+		// directly without bit-position arithmetic.
+		game_options->skulls = prop->skull_flags;
+		game_options->campaign_insertion_point = prop->campaign_insertion_point;
 		// Reach's ProcessSessionJoinState (haloreach.dll+0xDF18) drives the
 		// launch state machine off DAT_1824971ac (game_options+0xC = game_mode):
 		//   game_mode==1 (campaign) → DAT_180c1a114 = 4 (ProcessPlaybackFrame)
@@ -478,8 +609,22 @@ int c_game_instance_manager::launch_game(const s_game_prop* prop) {
 		// engine reads game_variant.gametype and would interpret it as
 		// "MP rules on a campaign map," wrong-pathing the per-frame
 		// subsystem walker.
-		if (prop->module == _module_halo2) {
-			game_options->campaign_insertion_point = 0;
+		// (halo2 hardcoded `campaign_insertion_point = 0` removed — the user-
+		// supplied value via the launcher prop now flows through. Defaults to
+		// 0 so the original behavior is preserved when the user doesn't pick.)
+		// halo4 campaign: dispatcher reads from custom_campaign_map_id, NOT
+		// map_id (per Round 3 RE of haloreach Engine_DispatchQueuedCommand
+		// — game_mode==1 branch reads custom_campaign_map_id and checks
+		// flags == 0x8888 for builtin or 0x1111 for insertion-point format;
+		// pattern is shared across engines per Round 4-6 cross-validation).
+		// Without this stamp halo4 logs "GAME QUIT[4]: no map selected"
+		// after 2s. The s_scenario_map_id default ctor already supplies
+		// flags=0x8888 + part1=0 + part2=0 so a plain assignment works.
+		// Other engines (halo2/halo3/halo3odst) currently rely on the same
+		// implicit-fallback that's failing on halo4 — extend this stamp to
+		// them if their campaigns also fail.
+		if (prop->module == _module_halo4) {
+			game_options->custom_campaign_map_id = prop->map;
 		}
 		break;
 	case _game_mode_spartan_ops:

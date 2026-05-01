@@ -17,6 +17,15 @@ struct s_game_prop {
 	int film = -1;
 
 	int game_tick = 60;
+
+	// Campaign-launch options (ignored for non-campaign modes).
+	//   skull_flags — bitmask of libmcc::e_skull. Stamped into
+	//   s_game_options::skulls before the engine reads it. 0 = no skulls.
+	//   campaign_insertion_point — engine-internal checkpoint index. 0 starts
+	//   the mission from the beginning; non-zero jumps to a level checkpoint
+	//   (per-game; halo3 typically supports 0..N for each scenario).
+	uint64_t skull_flags = 0;
+	int campaign_insertion_point = 0;
 };
 
 constexpr const char* k_game_names[]{
@@ -37,6 +46,9 @@ struct s_game_local {
 	std::wstring             map_variant_dir;
 	std::vector<std::string> hopper_game_variants;
 	std::vector<std::string> hopper_map_variants;
+	// Parallel to hopper_map_variants. -1 == unknown (libmcc parse failed or module not loaded);
+	// the imgui filter treats unknowns as "always visible" so a parse miss doesn't hide a file.
+	std::vector<int>         hopper_map_variant_ids;
 	std::vector<std::string> films;
 };
 
@@ -138,6 +150,12 @@ private:
 	bool m_game_paused;
 	libmcc::e_module m_game;
 	libmcc::i_game_engine* m_game_engine;
+	// Secondary engine — used by halo2 to host the Anniversary (groundhog)
+	// renderer alongside the classic halo2 engine. The primary game thread
+	// belongs to m_game_engine; the secondary is created + initialize()d
+	// only (no initialize_game), purely so its draw subsystem is wired up
+	// when halo2 toggles to Anniversary visuals. nullptr when not used.
+	libmcc::i_game_engine* m_game_engine_secondary = nullptr;
 	s_game_options_storage m_game_options_storage;
 
 	libmcc::e_module m_running_game = libmcc::k_module_none;

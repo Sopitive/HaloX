@@ -96,6 +96,19 @@ int APIENTRY WinMain(
 	}
 
 	console_logger()->initialize();
+	// Parse MCC's GameUserSettings.ini early so we can apply the user's
+	// preferred resolution + window mode to the swap chain BEFORE the
+	// rasterizer creates the window. The full mcc_user_settings_initialize()
+	// runs again later (post-game-manager) for the per-game profile-stamp
+	// path; this early call is just the same parser, which is idempotent.
+	mcc_user_settings_initialize();
+	// NOTE: deliberately do NOT apply graphics.resolution_x/y to the launcher
+	// window — those are the user's preferred IN-GAME render resolution, not
+	// the launcher chrome size.  Forcing the launcher to MCC's native res
+	// breaks the chrome on high-DPI displays (UI is microscopic at 4K) and,
+	// combined with fullscreen_mode, made the window non-draggable.  The
+	// launcher always opens at its 1280x720 default; the in-game swap-chain
+	// resolution is a separate concern (handled by rasterizer.x3d11.cpp).
 	// Per-instance kernel-object namespace. Two halox processes loading the
 	// same haloreach.dll would otherwise collide on every named mutex/event/
 	// file-mapping the engine creates for singleton coordination. Must run

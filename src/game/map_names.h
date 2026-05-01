@@ -6,6 +6,10 @@ struct s_map_entry {
 	libmcc::e_map_id id;
 	libmcc::e_module module;
 	const char* name;
+	// Engine-internal "legacy" map id stored inside .mvar files. Distinct from
+	// the libmcc e_map_id enum used everywhere else in halox. -1 if unknown
+	// (no mvars exist for the map, or we haven't filled in the table yet).
+	int legacy_map_id = -1;
 };
 
 // Friendly names for libmcc::e_map_id, with the owning module so we can filter
@@ -211,34 +215,34 @@ inline const s_map_entry k_map_entries[] = {
 	{ libmcc::_map_id_haloreach_the_pillar_of_autumn,   libmcc::_module_haloreach, "The Pillar of Autumn" },
 	{ libmcc::_map_id_haloreach_the_pillar_of_autumn_credits, libmcc::_module_haloreach, "Epilogue (Pillar Credits)" },
 	{ libmcc::_map_id_haloreach_lone_wolf,              libmcc::_module_haloreach, "Lone Wolf" },
-	{ libmcc::_map_id_haloreach_boardwalk,              libmcc::_module_haloreach, "MP: Boardwalk" },
-	{ libmcc::_map_id_haloreach_boneyard,               libmcc::_module_haloreach, "MP: Boneyard" },
-	{ libmcc::_map_id_haloreach_countdown,              libmcc::_module_haloreach, "MP: Countdown" },
-	{ libmcc::_map_id_haloreach_powerhouse,             libmcc::_module_haloreach, "MP: Powerhouse" },
-	{ libmcc::_map_id_haloreach_reflection,             libmcc::_module_haloreach, "MP: Reflection" },
-	{ libmcc::_map_id_haloreach_spire,                  libmcc::_module_haloreach, "MP: Spire" },
-	{ libmcc::_map_id_haloreach_sword_base,             libmcc::_module_haloreach, "MP: Sword Base" },
-	{ libmcc::_map_id_haloreach_zealot,                 libmcc::_module_haloreach, "MP: Zealot" },
-	{ libmcc::_map_id_haloreach_anchor_9,               libmcc::_module_haloreach, "MP: Anchor 9" },
-	{ libmcc::_map_id_haloreach_breakpoint,             libmcc::_module_haloreach, "MP: Breakpoint" },
-	{ libmcc::_map_id_haloreach_tempest,                libmcc::_module_haloreach, "MP: Tempest" },
-	{ libmcc::_map_id_haloreach_condemned,              libmcc::_module_haloreach, "MP: Condemned" },
-	{ libmcc::_map_id_haloreach_highlands,              libmcc::_module_haloreach, "MP: Highlands" },
-	{ libmcc::_map_id_haloreach_battle_canyon,          libmcc::_module_haloreach, "MP: Battle Canyon" },
-	{ libmcc::_map_id_haloreach_penance,                libmcc::_module_haloreach, "MP: Penance" },
-	{ libmcc::_map_id_haloreach_ridgeline,              libmcc::_module_haloreach, "MP: Ridgeline" },
-	{ libmcc::_map_id_haloreach_solitary,               libmcc::_module_haloreach, "MP: Solitary" },
-	{ libmcc::_map_id_haloreach_high_noon,              libmcc::_module_haloreach, "MP: High Noon" },
-	{ libmcc::_map_id_haloreach_breakneck,              libmcc::_module_haloreach, "MP: Breakneck" },
-	{ libmcc::_map_id_haloreach_forge_world,            libmcc::_module_haloreach, "Forge World" },
-	{ libmcc::_map_id_haloreach_beachhead,              libmcc::_module_haloreach, "FF: Beachhead" },
-	{ libmcc::_map_id_haloreach_corvette,               libmcc::_module_haloreach, "FF: Corvette" },
-	{ libmcc::_map_id_haloreach_courtyard,              libmcc::_module_haloreach, "FF: Courtyard" },
-	{ libmcc::_map_id_haloreach_glacier,                libmcc::_module_haloreach, "FF: Glacier" },
-	{ libmcc::_map_id_haloreach_holdout,                libmcc::_module_haloreach, "FF: Holdout" },
-	{ libmcc::_map_id_haloreach_outpost,                libmcc::_module_haloreach, "FF: Outpost" },
-	{ libmcc::_map_id_haloreach_overlook,               libmcc::_module_haloreach, "FF: Overlook" },
-	{ libmcc::_map_id_haloreach_waterfront,             libmcc::_module_haloreach, "FF: Waterfront" },
+	{ libmcc::_map_id_haloreach_boardwalk,              libmcc::_module_haloreach, "MP: Boardwalk", 1035 },
+	{ libmcc::_map_id_haloreach_boneyard,               libmcc::_module_haloreach, "MP: Boneyard", 1080 },
+	{ libmcc::_map_id_haloreach_countdown,              libmcc::_module_haloreach, "MP: Countdown", 1020 },
+	{ libmcc::_map_id_haloreach_powerhouse,             libmcc::_module_haloreach, "MP: Powerhouse", 1055 },
+	{ libmcc::_map_id_haloreach_reflection,             libmcc::_module_haloreach, "MP: Reflection", 1150 },
+	{ libmcc::_map_id_haloreach_spire,                  libmcc::_module_haloreach, "MP: Spire", 1200 },
+	{ libmcc::_map_id_haloreach_sword_base,             libmcc::_module_haloreach, "MP: Sword Base", 1000 },
+	{ libmcc::_map_id_haloreach_zealot,                 libmcc::_module_haloreach, "MP: Zealot", 1040 },
+	{ libmcc::_map_id_haloreach_anchor_9,               libmcc::_module_haloreach, "MP: Anchor 9", 2001 },
+	{ libmcc::_map_id_haloreach_breakpoint,             libmcc::_module_haloreach, "MP: Breakpoint", 2002 },
+	{ libmcc::_map_id_haloreach_tempest,                libmcc::_module_haloreach, "MP: Tempest", 2004 },
+	{ libmcc::_map_id_haloreach_condemned,              libmcc::_module_haloreach, "MP: Condemned", 1500 },
+	{ libmcc::_map_id_haloreach_highlands,              libmcc::_module_haloreach, "MP: Highlands", 1510 },
+	{ libmcc::_map_id_haloreach_battle_canyon,          libmcc::_module_haloreach, "MP: Battle Canyon", 10020 },
+	{ libmcc::_map_id_haloreach_penance,                libmcc::_module_haloreach, "MP: Penance", 10010 },
+	{ libmcc::_map_id_haloreach_ridgeline,              libmcc::_module_haloreach, "MP: Ridgeline", 10030 },
+	{ libmcc::_map_id_haloreach_solitary,               libmcc::_module_haloreach, "MP: Solitary", 10070 },
+	{ libmcc::_map_id_haloreach_high_noon,              libmcc::_module_haloreach, "MP: High Noon", 10060 },
+	{ libmcc::_map_id_haloreach_breakneck,              libmcc::_module_haloreach, "MP: Breakneck", 10050 },
+	{ libmcc::_map_id_haloreach_forge_world,            libmcc::_module_haloreach, "Forge World", 3006 },
+	{ libmcc::_map_id_haloreach_beachhead,              libmcc::_module_haloreach, "FF: Beachhead", 7060 },
+	{ libmcc::_map_id_haloreach_corvette,               libmcc::_module_haloreach, "FF: Corvette", 7110 },
+	{ libmcc::_map_id_haloreach_courtyard,              libmcc::_module_haloreach, "FF: Courtyard", 7020 },
+	{ libmcc::_map_id_haloreach_glacier,                libmcc::_module_haloreach, "FF: Glacier", 7130 },
+	{ libmcc::_map_id_haloreach_holdout,                libmcc::_module_haloreach, "FF: Holdout", 7080 },
+	{ libmcc::_map_id_haloreach_outpost,                libmcc::_module_haloreach, "FF: Outpost", 7030 },
+	{ libmcc::_map_id_haloreach_overlook,               libmcc::_module_haloreach, "FF: Overlook", 7000 },
+	{ libmcc::_map_id_haloreach_waterfront,             libmcc::_module_haloreach, "FF: Waterfront", 7040 },
 	{ libmcc::_map_id_haloreach_unearthed,              libmcc::_module_haloreach, "FF: Unearthed" },
 	{ libmcc::_map_id_haloreach_installation_04,        libmcc::_module_haloreach, "Installation 04" },
 
@@ -258,6 +262,15 @@ inline constexpr int k_map_entry_count = sizeof(k_map_entries) / sizeof(k_map_en
 inline const char* find_map_name(libmcc::e_map_id id) {
 	for (auto& e : k_map_entries) if (e.id == id) return e.name;
 	return "(unknown)";
+}
+
+// Translate libmcc e_map_id → engine-internal "legacy" map id stored in mvars.
+// Returns -1 when the table doesn't have a value for this map (campaign-only,
+// or another module we haven't filled in). The mvar dropdown filter falls
+// back to "show all" when this returns -1.
+inline int find_legacy_map_id(libmcc::e_map_id id) {
+	for (auto& e : k_map_entries) if (e.id == id) return e.legacy_map_id;
+	return -1;
 }
 
 // Derive which game-mode buckets a map can be launched in from its display

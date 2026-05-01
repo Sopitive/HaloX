@@ -60,6 +60,76 @@ const wchar_t* resolve_mcc_root_impl() {
 	return nullptr;
 }
 
+// Read an mvar file and pull out its built-in map id. Walks BLF chunks (each:
+// 4 magic + 4 size BE + 2 ver BE + 2 flags BE + 20 sha1 + 4 contentLen BE +
+// payload), finds "mvar", then bit-decodes the GameVariantHeader far enough
+// to reach the 32-bit MapId field at bit offset 301. Bits are MSB-first
+// within each byte (matches MVARStudio's BitstreamReader). Returns -1 on any
+// failure (missing/truncated/no mvar chunk).
+static int read_mvar_map_id(const wchar_t* path) {
+	// mvar chunk header (with payload up to MapId) sits ~800 bytes into the
+	// file. Read just a small prefix so 1000+ files don't take seconds at
+	// startup. FILE_FLAG_SEQUENTIAL_SCAN hints to the OS not to populate the
+	// whole-file cache.
+	HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+	                       OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+	if (h == INVALID_HANDLE_VALUE) return -1;
+
+	const DWORD k_prefix = 2048;
+	uint8_t prefix[k_prefix];
+	DWORD got = 0;
+	BOOL ok = ReadFile(h, prefix, k_prefix, &got, nullptr);
+	CloseHandle(h);
+	if (!ok || got < 36) return -1;
+
+	const uint8_t* buf_data = prefix;
+	DWORD fsize = got;
+
+	auto be32 = [](const uint8_t* p) {
+		return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+		       (uint32_t)p[2] << 8  | (uint32_t)p[3];
+	};
+
+	uint32_t off = 0;
+	while (off + 12 <= fsize) {
+		const uint8_t* hp = buf_data + off;
+		uint32_t csize = be32(hp + 4);
+		if (csize < 12) break;
+
+		if (memcmp(hp, "mvar", 4) == 0) {
+			// We only read a 2 KB prefix, so an mvar chunk's full csize will
+			// almost certainly extend past what we have — that's fine. Just
+			// require the bytes through MapId (header 36 + ~42 of payload).
+			const size_t k_need = 36 + 42;
+			if (off + k_need > fsize) return -1;
+			const uint8_t* payload = hp + 36;
+			size_t psize = (size_t)fsize - (off + 36);
+
+			// Bit position of MapId field within payload:
+			//   4 (Type) + 32 (FileLength) + 64*4 (Unk08..Unk20)
+			//   + 3 (Activity) + 3 (GameMode) + 3 (Engine) = 301 bits.
+			const size_t map_id_bit = 301;
+			if (map_id_bit + 32 > psize * 8) return -1;
+
+			uint32_t mid = 0;
+			for (size_t i = 0; i < 32; ++i) {
+				size_t bit_pos = map_id_bit + i;
+				size_t byte_idx = bit_pos >> 3;
+				int bit_idx = 7 - (int)(bit_pos & 7);
+				uint32_t b = (payload[byte_idx] >> bit_idx) & 1;
+				mid = (mid << 1) | b;
+			}
+			return (int)mid;
+		}
+
+		// Past-prefix walks are bounded by what we read. Bail when the next
+		// chunk would extend beyond it; mvar should have appeared by then.
+		if ((uint64_t)off + csize > fsize) break;
+		off += csize;
+	}
+	return -1;
+}
+
 // Enumerate variant files in `dir` matching `pattern` (e.g. "*.bin"). Returns
 // true if at least one file was found. Stores filenames in `out`.
 static bool enumerate_variants(const wchar_t* dir, const wchar_t* pattern,
@@ -98,6 +168,7 @@ int c_game_instance_manager::load_local() {
 
 		local->hopper_game_variants.clear();
 		local->hopper_map_variants.clear();
+		local->hopper_map_variant_ids.clear();
 		local->game_variant_dir.clear();
 		local->map_variant_dir.clear();
 
@@ -138,10 +209,30 @@ int c_game_instance_manager::load_local() {
 			}
 		}
 
+		// Index each mvar's built-in map id by reading its BLF/bitstream header
+		// directly. Lets the launcher dropdown filter map variants against the
+		// selected map. -1 means we couldn't parse it (truncated/foreign); the
+		// UI treats those as map-agnostic so a parse miss never hides a file.
+		local->hopper_map_variant_ids.assign(local->hopper_map_variants.size(), -1);
+		int indexed = 0;
+		if (!local->hopper_map_variants.empty() && !local->map_variant_dir.empty()) {
+			for (size_t mi = 0; mi < local->hopper_map_variants.size(); ++mi) {
+				wchar_t fpath[1024];
+				swprintf(fpath, 1024, L"%s\\%hs",
+					local->map_variant_dir.c_str(),
+					local->hopper_map_variants[mi].c_str());
+				int id = read_mvar_map_id(fpath);
+				local->hopper_map_variant_ids[mi] = id;
+				if (id != -1) indexed++;
+			}
+		}
+
 		CONSOLE_LOG_INFO(
-			"  %-9s game_variants=%zu map_variants=%zu",
+			"  %-9s game_variants=%zu map_variants=%zu (indexed %d/%zu)",
 			title,
 			local->hopper_game_variants.size(),
+			local->hopper_map_variants.size(),
+			indexed,
 			local->hopper_map_variants.size());
 	}
 

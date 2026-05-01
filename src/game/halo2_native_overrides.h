@@ -34,6 +34,19 @@ void halo2_apply_native_overrides();
 void halo2_revert_to_checkpoint();
 void halo2_restart_mission();
 
+// Disable + remove the three MinHook detours installed by the per-launch
+// install path (is_key_held, poller, dur_read). MUST be called BEFORE
+// unload_modules tears halo2.dll out from under MinHook's bookkeeping —
+// once the DLL is unmapped, MH_RemoveHook would write to freed memory.
+//
+// On relaunch, install_is_key_held_hook() (driven by halo2_apply_native_overrides)
+// re-runs against the new HMODULE and re-installs cleanly. Without this,
+// the "g_hooked_module != nullptr" guard skips the second install and all
+// halo2 input goes through the native path with no halox remap.
+//
+// Idempotent. No-op if hooks were never installed or already removed.
+void halo2_uninstall_input_hooks();
+
 // Stop all halo2 audio immediately (Miles/AIL channels + IXAudio2 engine).
 // Call from a worker thread BEFORE terminating the game thread on quit-
 // to-menu, otherwise the game thread is killed but its audio threads

@@ -256,25 +256,33 @@ bool progress_is_loading() {
 		}
 	}
 
-	// Stable_alive means the engine is rendering real frames. We extend
-	// the load UI for an additional k_finalize_extend_ms after that
-	// transition so the post-load black-frame swap is hidden behind a
-	// smooth bar-to-100% animation instead of a hard cut.
+	// Stable_alive means the engine is rendering real frames for 3 consecutive
+	// 1s samples, so it lags FIRST_ALIVE by ~3s. We use stable for campaign
+	// (filters out cutscene black-frame flicker), then optionally extend by
+	// k_finalize_extend_ms to mask the post-load black-frame swap.
 	//
-	// EXEMPT multiplayer: MP loads have their own engine-side lobby/spawn
-	// flow and don't suffer the post-load black-frame artifact campaign
-	// does. Adding the 5s extension to MP just makes the user wait extra
-	// for nothing. Drop straight to "not loading" the moment MP reports
-	// stable_alive.
-	const bool stable = liveness_stable_alive();
+	// EXEMPT multiplayer: MP has no cutscene flicker and no post-load black-
+	// frame artifact — the lobby/spawn frame is the real game and the user
+	// sees the load screen as a pure "still loading?" gate. Use first-alive
+	// (no 3s consecutive-sample wait, no finalize extension) so the load
+	// screen drops the moment MP starts rendering anything.
 	const bool is_campaign = (gim->get_mode() == _game_mode_campaign);
-	// MP and halo3 dismiss immediately on stable_alive — only halo2/reach
-	// campaign needs the finalize extension to mask their post-load black-
-	// frame swap. Halo3's load screen would otherwise persist 5s past actual
-	// gameplay start.
+	if (!is_campaign) {
+		if (liveness_first_alive_seen()) {
+			return false;
+		}
+		// Fall through to the no-alive-yet timeout cap below.
+		auto game = gim->get_game();
+		const uint64_t cap_ms =
+			(game == _module_halo2 || game == _module_haloreach) ? 90000 : 30000;
+		return elapsed_ms < cap_ms;
+	}
+
+	// Campaign path: require stable (filters cutscene flicker) and only halo2/
+	// reach need the finalize extension to mask their post-load black-frame.
+	const bool stable = liveness_stable_alive();
 	const bool needs_finalize_extend =
-		is_campaign &&
-		(gim->get_game() == _module_halo2 || gim->get_game() == _module_haloreach);
+		gim->get_game() == _module_halo2 || gim->get_game() == _module_haloreach;
 	if (stable && !needs_finalize_extend) {
 		return false;
 	}

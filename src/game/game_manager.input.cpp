@@ -74,6 +74,38 @@ bool __fastcall c_game_manager::get_input_state(e_local_player player, s_input_s
 		const bool kbm_sticky = win32_input_kbm_sticky_active();
 		state->is_km = (kbm_sticky || !has_pad) ? 1 : 0;
 
+		// Vehicle / zoom camera fix. Halo 2 is a console port — scoped fine-
+		// aim and turret/vehicle aim are wired internally to the right-stick
+		// regardless of the is_km flag (the kbm "look" path that drives
+		// on-foot mouse-look isn't the same path that drives those modes).
+		// Without a synthesized right-stick value, the camera locks the
+		// instant the player zooms or boards a vehicle. Mirror the mouse
+		// delta into thumbRX/RY so the right-stick path sees identical motion.
+		//
+		// Scale: the engine treats thumbR in [-32768, 32767] as "stick
+		// deflection". Mouse delta arrives already scaled by sensitivity *
+		// k_mouse_delta_scale (0.10) inside win32_input_snapshot, so a
+		// fast flick is a few units. Multiplying by ~2000 maps a fast flick
+		// to ~10k–20k thumb units — in the same ballpark as a real stick.
+		// Y is inverted because XInput's positive Y is "up" while our mouse
+		// dY is positive downward.
+		//
+		// Done AFTER is_km is computed and AFTER the gamepad_has_activity
+		// check so the synthesized stick values can't accidentally flip the
+		// kbm-sticky mode off. Only synthesized when not gated by imgui
+		// (mouse deltas are already zeroed in that case above).
+		if (state->is_km && !g_show_imgui) {
+			constexpr float k_mouse_to_stick = 2000.0f;
+			float sx = state->mouse.lX *  k_mouse_to_stick;
+			float sy = state->mouse.lY * -k_mouse_to_stick;  // invert Y for XInput convention
+			if (sx >  32767.0f) sx =  32767.0f;
+			if (sx < -32768.0f) sx = -32768.0f;
+			if (sy >  32767.0f) sy =  32767.0f;
+			if (sy < -32768.0f) sy = -32768.0f;
+			state->gamepad.thumbRX = (int16_t)sx;
+			state->gamepad.thumbRY = (int16_t)sy;
+		}
+
 		// Diagnostic: per-100-call snapshot of the input-mode arbitration so
 		// we can verify which path (kbm vs pad) the engine is being told to
 		// use. Throttled so it doesn't flood at 60Hz.

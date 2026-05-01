@@ -161,6 +161,14 @@ static const s_halo2_default_bind k_halo2_defaults[] = {
 	{ _game_abstract_button_straferight,   0x44 }, // D   — CONFIRMED via FUN_1806D5FA0 @ 1806d6347
 	{ _game_abstract_button_reload,        0x52 }, // R   — CONFIRMED via FUN_1806D5FA0 @ 1806d6359
 	{ _game_abstract_button_flashlight,    0x46 }, // F   — CONFIRMED via FUN_1806D5FA0 @ 1806d637d
+	// Throwgrenade — CONFIRMED via FUN_1806D5FA0 hardcoded G poll. Engine ALSO
+	// has a separate switchgrenade action_id (default G) in the binding table,
+	// so without this remap pressing G triggers throw via FUN_1806D5FA0 AND
+	// switch via the binding-table dispatcher. Adding throwgrenade here makes
+	// is_key_held(G) read the user's chosen throw key — so FUN_1806D5FA0's G
+	// poll only fires throw when the user presses their throw key, leaving
+	// G-press free to fire switchgrenade alone.
+	{ _game_abstract_button_throwgrenade,  0x47 }, // G
 };
 
 // 256-entry VK→VK substitution table. Initialized to identity (default[i] = i).
@@ -243,14 +251,29 @@ static const s_h2_action_entry k_h2_action_table[] = {
 	// Melee — action 5 has Q AND MMB as slot 0/1; user remaps the slot we own (slot 0).
 	{ _game_abstract_button_meleeattack,    {  5, -1, -1, -1, -1, -1 }, 0x04, 1 },
 
-	// Reload / Flashlight — abstract → action_id mapping was previously
-	// reload→6, flashlight→31 (engine action_id semantics). User reports
-	// the in-game effect is inverted: pressing the MCC reload key triggers
-	// flashlight and vice versa. Swap the action_id assignments so the
-	// abstract buttons drive the engine actions the user actually expects.
-	{ _game_abstract_button_reload,         { 31, -1, -1, -1, -1, -1 }, 0x52, 1 },
-	{ _game_abstract_button_reloadsecondary,{ 46, -1, -1, -1, -1, -1 }, 0x52, 1 },
-	{ _game_abstract_button_flashlight,     {  6, -1, -1, -1, -1, -1 }, 0x52, 1 },
+	// Reload / Flashlight / Reloadsecondary — DELIBERATELY NOT WRITTEN to the
+	// binding table. We tried both (reload→6, flashlight→31) and the swap
+	// (reload→31, flashlight→6); the user reports both reload and flashlight
+	// firing on Z either way. Conclusion: action_ids 6 / 31 / 46 don't map
+	// cleanly 1:1 to libmcc reload / flashlight / reloadsecondary semantics —
+	// likely each abstract button drives multiple engine actions (primary +
+	// dual-wield + vehicle contexts) and the relationship isn't 1:1.
+	//
+	// Instead, rely on FUN_1806D5FA0's direct-VK polling path, which polls
+	// VK_R for reload and VK_F for flashlight unconditionally. With the user's
+	// remap encoded into g_vk_remap (k_halo2_defaults handles those two), the
+	// FUN_1806D1620 detour returns the correct held state for each press.
+	// Engine action_ids 6 (default Z) and 31 (default R) keep their factory
+	// defaults — pressing the engine's default key still fires the engine's
+	// default action_id. If the user picks a non-default key for reload or
+	// flashlight, the binding-table dispatcher (FUN_1806D8AB0) will not see
+	// it, but the direct-VK path will — which is the path that actually
+	// drives the gameplay command struct in halo2.
+	//
+	// TODO(re-RE): query Ghidra to identify which engine action_id is
+	// definitively reload vs flashlight (probe FUN_1806D8AB0's output bytes
+	// in DAT_1815F1E30[player*0xC0 + action_id] and correlate with observed
+	// gameplay), then re-add only the verified mapping.
 
 	// Fire — actions 10, 23, 24 all bound to LMB (10 primary; 23/24 are dual-wield contexts).
 	{ _game_abstract_button_fire,           { 10, 23, 24, -1, -1, -1 }, 0x01, 1 },
@@ -378,20 +401,27 @@ static void h2_apply_binding_table_overrides() {
 			h2_write_binding_slot(player0, action_idx, /*slot=*/ 0,
 			                      /*type=*/ 1, /*key_id=*/ (int)user_vk);
 
-			// Clear OTHER type=1 (keyboard) slots within this action's count
-			// so the user's chosen key is the EXCLUSIVE keyboard trigger.
-			// Otherwise the engine's pre-init defaults co-fire — e.g. action
-			// 6 (default Z, count=3) would still fire on Z even after we wrote
-			// the user's reload key to slot 0, because slot 1+ kept Z. Type=0
-			// (mouse) and type=2 (gamepad) slots are preserved so controller
-			// bindings keep working.
+			// Clear OTHER type=1 (keyboard) slots whose key_id DIFFERS from the
+			// user's chosen key. Two-key co-fire problem: action 6 (default Z,
+			// count=3) would still fire on Z after we wrote the user's reload
+			// key to slot 0, because slots 1+ kept Z. Solution: zero slot 1+
+			// when their key_id != user_vk.
+			//
+			// CRITICAL: do NOT clear slots whose key_id MATCHES user_vk. Halo 2
+			// uses the multi-slot pattern with the SAME key + different
+			// threshold to distinguish tap vs hold (e.g. action 19/47 have
+			// slot 0 = E threshold=tap and slot 1 = E threshold=hold for "tap E
+			// to swap weapon" vs "hold E to pick up"). Zeroing the matching
+			// slot 1 was the cause of hold-E for pickup not registering.
+			// Type=0 (mouse) and type=2 (gamepad) slots are preserved so
+			// controller bindings keep working.
 			int32_t count = h2_read_action_count(player0, action_idx);
 			if (count > 1 && count <= k_h2_max_slots_per_action) {
 				uintptr_t action_off = k_h2_action_table_off + (uintptr_t)action_idx * k_h2_action_stride;
 				for (int s = 1; s < count; ++s) {
 					uintptr_t slot_off = action_off + 4 + (uintptr_t)s * 12;
 					int32_t* p = reinterpret_cast<int32_t*>(player0 + slot_off);
-					if (p[0] == 1 /*type=keyboard*/) {
+					if (p[0] == 1 /*type=keyboard*/ && p[1] != (int32_t)user_vk) {
 						p[1] = 0;  // key_id=0 → reads dur[0] which is always 0 → never fires.
 					}
 				}
@@ -611,14 +641,15 @@ static unsigned long long __fastcall h2_is_key_held_detour(short vk) {
 static unsigned long long __fastcall h2_dur_read_detour(short vk) {
 	if (g_show_imgui) return 0ULL;
 	uint16_t v = (uint16_t)vk;
+	uint16_t v_in = v;  // legacy log var (no longer pre-remap; kept for log call)
 
-	if (g_remap_armed && v < 256) {
-		uint16_t remapped = g_vk_remap[v];
-		if (remapped != v) {
-			vk = (short)remapped;
-			v  = remapped;
-		}
-	}
+	// Intentionally NO g_vk_remap here. The binding-table writer
+	// (h2_apply_binding_table_overrides) already stamps slot 0 with the user's
+	// chosen VK, so the dispatcher polls the user's key directly via dur_read.
+	// Applying the FUN_1806D5FA0-direction remap here would double-substitute:
+	// e.g. remap[G]=Q (user's throwgrenade) would make ALL dur_read(G) calls
+	// read Q's state — which silently breaks any other action_id whose slot 0
+	// keeps the engine's G default (notably switchgrenade).
 
 	if (v < 256) {
 		uint8_t kb[256] = {};
@@ -628,7 +659,24 @@ static unsigned long long __fastcall h2_dur_read_detour(short vk) {
 			uint32_t t = (uint32_t)g_h2_held_ticks[v] + 1;
 			if (t > 0xFFFFu) t = 0xFFFFu;
 			g_h2_held_ticks[v] = (uint16_t)t;
+			// Targeted diagnostic: log E only on rising edge and once per
+			// 60-call milestone so we can see (a) whether engine is querying
+			// dur(E) at all, (b) whether kb[E] is set, (c) what counter we
+			// return. Will reveal if hold-E is failing at input layer or
+			// further up the dispatcher.
+			if (v_in == 0x45 || v == 0x45) {
+				uint16_t prev_t = (uint16_t)(t - 1);
+				if (prev_t == 0 || (g_h2_held_ticks[v] % 60) == 0) {
+					CONSOLE_LOG_INFO("[h2 E-probe] dur_read(vk_in=0x%X→vk=0x%X) pressed=1 kb[E]=%d ticks=%u",
+						v_in, v, (int)kb[0x45], (unsigned)g_h2_held_ticks[v]);
+				}
+			}
 			return (unsigned long long)g_h2_held_ticks[v];
+		}
+		// Falling edge for E: log when ticks drops to zero (i.e. user released).
+		if ((v_in == 0x45 || v == 0x45) && g_h2_held_ticks[v] != 0) {
+			CONSOLE_LOG_INFO("[h2 E-probe] dur_read(vk_in=0x%X→vk=0x%X) released kb[E]=%d (was held %u ticks)",
+				v_in, v, (int)kb[0x45], (unsigned)g_h2_held_ticks[v]);
 		}
 		g_h2_held_ticks[v] = 0;
 		return 0ULL;
@@ -667,9 +715,54 @@ static unsigned long long __fastcall h2_action_lookup_detour(
 	return rv;
 }
 
+void halo2_uninstall_input_hooks() {
+	if (!g_hooked_module) return;
+	auto base = reinterpret_cast<uintptr_t>(g_hooked_module);
+
+	struct s_hook_target { uintptr_t rva; const char* name; };
+	const s_hook_target targets[] = {
+		{ k_h2_is_key_held_rva, "is_key_held" },
+		{ k_h2_poller_rva,      "poller"      },
+		{ k_h2_dur_read_rva,    "dur_read"    },
+	};
+	for (auto& t : targets) {
+		void* target = reinterpret_cast<void*>(base + t.rva);
+		__try {
+			MH_DisableHook(target);
+			MH_RemoveHook(target);
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			CONSOLE_LOG_WARN("halo2 input hook uninstall (%s @ %p): SEH 0x%08lX",
+				t.name, target, GetExceptionCode());
+		}
+	}
+	CONSOLE_LOG_INFO("halo2 input hooks uninstalled (mod=%p)", g_hooked_module);
+	g_is_key_held_orig   = nullptr;
+	g_poll_orig          = nullptr;
+	g_dur_read_orig      = nullptr;
+	g_action_lookup_orig = nullptr;
+	g_hooked_module      = nullptr;
+}
+
 static void install_is_key_held_hook(HMODULE mod) {
 	if (g_hooked_module == mod) return;
-	if (g_hooked_module != nullptr) return;  // hooked a previous module — module rebase across launches not handled here
+	if (g_hooked_module != nullptr) {
+		// Stale install from a previous launch (DLL was cycled on quit).
+		// Caller should have invoked halo2_uninstall_input_hooks() before
+		// unload_modules; if not, the OLD module's address is now stale and
+		// MH_RemoveHook would touch unmapped memory. Drop our bookkeeping
+		// and proceed to install against the new module — MinHook's internal
+		// table for the dead address will be orphaned but never referenced
+		// (the install targets here use the FRESH `mod`).
+		CONSOLE_LOG_WARN("halo2 input hook: stale g_hooked_module=%p detected "
+			"(new mod=%p) — orphaning prior MinHook records and re-installing. "
+			"Call halo2_uninstall_input_hooks() before unload_modules to avoid this.",
+			g_hooked_module, mod);
+		g_is_key_held_orig   = nullptr;
+		g_poll_orig          = nullptr;
+		g_dur_read_orig      = nullptr;
+		g_action_lookup_orig = nullptr;
+		g_hooked_module      = nullptr;
+	}
 
 	if (!g_minhook_initialized) {
 		MH_STATUS st = MH_Initialize();
@@ -738,6 +831,12 @@ static void install_is_key_held_hook(HMODULE mod) {
 		return;
 	}
 	CONSOLE_LOG_INFO("halo2 dur-read hook installed @ %p (halo2+0x%llX)", dur_target, (unsigned long long)k_h2_dur_read_rva);
+
+	// Diagnostic: action_lookup hook (DISABLED). Logged each action_id's
+	// rising edge but appears to interfere with halo2's per-frame queries
+	// in a way that broke Anniversary visuals — disabling. If we need this
+	// data again, install it briefly and accept the visual side-effect, or
+	// rewrite as a probe via the bridge instead of an in-process hook.
 }
 
 static HMODULE halo2_module() {
@@ -845,12 +944,19 @@ void halo2_apply_native_overrides() {
 				uintptr_t off = k_h2_action_table_off + (uintptr_t)a * k_h2_action_stride;
 				int32_t* p = reinterpret_cast<int32_t*>(g_h2_binding_player0 + off);
 				int32_t count = p[0];
-				if (count <= 0 || count > 8) continue;  // skip empty / nonsense
-				int32_t s0_type   = p[1];
-				int32_t s0_key_id = p[2];
-				int32_t s0_thresh = p[3];
-				CONSOLE_LOG_INFO("  action[%2d] count=%d slot0={type=%d key=0x%02X(%d) thresh=%d}",
-					a, count, s0_type, (unsigned)s0_key_id, s0_key_id, s0_thresh);
+				if (count <= 0 || count > 8) continue;
+				// Dump up to all 8 slots (full picture — single slot 0 wasn't
+				// enough to diagnose the reload/flashlight on-Z dual-fire bug).
+				char buf[256];
+				int n = snprintf(buf, sizeof(buf), "  action[%2d] count=%d", a, count);
+				for (int s = 0; s < count && s < 8; ++s) {
+					int32_t* sp = p + 1 + s * 3;
+					n += snprintf(buf + n, sizeof(buf) - n,
+						" s%d={t=%d k=0x%02X th=%d}",
+						s, sp[0], (unsigned)sp[1], sp[2]);
+					if (n >= (int)sizeof(buf) - 32) break;
+				}
+				CONSOLE_LOG_INFO("%s", buf);
 			}
 			CONSOLE_LOG_INFO("halo2 binding-table DIAGNOSTIC end");
 		}

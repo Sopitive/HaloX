@@ -5,6 +5,7 @@
 #include "../main/main.h"
 #include "../input/win32_input.h"
 #include "../game/mcc_user_settings.h"
+#include "../game/halox_audio.h"
 #include "../game/game_instance_manager.h"
 #include "../game/halo2_native_overrides.h"
 #include "../ui/ui_theme.h"
@@ -135,37 +136,140 @@ void page_input() {
 		"Picking a Title applies that game's MCC sensitivity.");
 }
 
+// Coalesce TOML writes — dragging a slider produces dozens of edits per
+// second; we'd churn %APPDATA% if we wrote on every changed frame. The
+// pattern: any edit sets s_settings_dirty AND records the frame's time;
+// page_settings flushes if dirty AND >500ms since the last edit (so the
+// user has stopped moving) OR the page is about to be left.
+static bool   s_settings_dirty       = false;
+static double s_settings_dirty_until = 0.0;
+
+static void settings_mark_dirty() {
+	s_settings_dirty       = true;
+	s_settings_dirty_until = ImGui::GetTime() + 0.5;  // 500ms quiescence
+}
+
+static void settings_maybe_flush() {
+	if (s_settings_dirty && ImGui::GetTime() >= s_settings_dirty_until) {
+		mcc_user_settings_save();
+		s_settings_dirty = false;
+	}
+}
+
 void page_settings() {
 	using namespace libmcc;
-	ImGui::TextUnformatted("MCC GameUserSettings.ini (per-game):");
 	auto* s = mcc_user_settings_mut();
 	if (!s->loaded) {
-		ImGui::TextDisabled("(not loaded — file missing or unreadable)");
+		ImGui::TextDisabled("(settings not loaded — TOML missing AND MCC ini missing)");
 		return;
 	}
+
+	// Game selector. v1 wires only halo2; other games show the same widgets
+	// but most won't take effect until per-game appliers exist (e.g. Wwise
+	// audio for haloreach, h2a, etc.).
+	static int s_module = (int)_module_halo2;
 	static const char* names[k_game_count] = {
 		"halo1", "halo2", "halo3", "halo4", "groundhog", "halo3odst", "haloreach"
 	};
-	if (ImGui::BeginTable("settings", 5,
-			ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders)) {
-		ImGui::TableSetupColumn("game");
-		ImGui::TableSetupColumn("sensitivity");
-		ImGui::TableSetupColumn("FOV");
-		ImGui::TableSetupColumn("vehicle FOV");
-		ImGui::TableSetupColumn("invert Y");
-		ImGui::TableHeadersRow();
+	ImGui::TextUnformatted("Game:");
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(160.0f);
+	if (ImGui::BeginCombo("##halox_settings_game", names[s_module])) {
 		for (int i = 0; i < k_game_count; ++i) {
-			ImGui::TableNextRow();
-			ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(names[i]);
-			ImGui::TableSetColumnIndex(1); ImGui::Text("%.3f", s->mouse_sensitivity[i]);
-			ImGui::TableSetColumnIndex(2); ImGui::Text("%d",   s->fov[i]);
-			ImGui::TableSetColumnIndex(3); ImGui::Text("%d",   s->vehicle_fov[i]);
-			ImGui::TableSetColumnIndex(4); ImGui::Text("%s",   s->mouse_look_inverted[i] ? "yes" : "no");
+			bool selected = (i == s_module);
+			if (ImGui::Selectable(names[i], selected)) s_module = i;
+			if (selected) ImGui::SetItemDefaultFocus();
 		}
-		ImGui::EndTable();
+		ImGui::EndCombo();
 	}
-	ImGui::Dummy(ImVec2(0, 12.0f));
-	ImGui::TextDisabled("Edit live values via the INPUT page; they sync to MCC's ini on title-switch.");
+	ImGui::SameLine();
+	ImGui::TextDisabled("(saved to halox_settings.toml)");
+
+	const auto module = (e_module)s_module;
+	const bool h2 = (module == _module_halo2);
+
+	ImGui::Separator();
+	ImGui::TextUnformatted("Audio");
+	{
+		auto& a = s->audio[module];
+		// Disable the slider for games whose audio backend isn't wired yet.
+		const bool audio_supported = h2 || module == _module_halo1;
+		if (!audio_supported) {
+			ImGui::TextDisabled("(audio not yet wired for %s — Wwise RE pending)", names[module]);
+		}
+		ImGui::BeginDisabled(!audio_supported);
+		if (ImGui::SliderInt("master##audio", &a.master_volume, 0, 100, "%d%%")) {
+			settings_mark_dirty();
+			halox::audio::apply_audio_for_module(module);
+		}
+		// SFX/music/voice are placeholders for now — Miles only exposes a
+		// digital master. Bus-level controls need engine-side RE (find the
+		// volume globals halo2 reads and hook them).
+		ImGui::BeginDisabled(true);
+		ImGui::SliderInt("sfx##audio",   &a.sfx_volume,   0, 100, "%d%%");
+		ImGui::SliderInt("music##audio", &a.music_volume, 0, 100, "%d%%");
+		ImGui::SliderInt("voice##audio", &a.voice_volume, 0, 100, "%d%%");
+		ImGui::EndDisabled();
+		if (ImGui::Checkbox("muted", &a.muted)) {
+			settings_mark_dirty();
+			halox::audio::apply_audio_for_module(module);
+		}
+		ImGui::EndDisabled();
+	}
+
+	ImGui::Separator();
+	ImGui::TextUnformatted("View");
+	if (ImGui::SliderInt("FOV##view",         &s->fov[module],         0, 120, s->fov[module] == 0 ? "default" : "%d")) {
+		settings_mark_dirty();
+		apply_mcc_settings_for_module(module);
+	}
+	if (ImGui::SliderInt("vehicle FOV##view", &s->vehicle_fov[module], 0, 120, s->vehicle_fov[module] == 0 ? "default" : "%d")) {
+		settings_mark_dirty();
+		apply_mcc_settings_for_module(module);
+	}
+
+	ImGui::Separator();
+	ImGui::TextUnformatted("Mouse");
+	if (ImGui::SliderFloat("sensitivity##mouse", &s->mouse_sensitivity[module], 0.1f, 5.0f, "%.2f")) {
+		settings_mark_dirty();
+		apply_mcc_settings_for_module(module);
+	}
+	if (ImGui::Checkbox("invert Y##mouse", &s->mouse_look_inverted[module])) {
+		settings_mark_dirty();
+		apply_mcc_settings_for_module(module);
+	}
+	if (ImGui::Checkbox("smoothing##mouse", &s->mouse_smoothing[module])) {
+		settings_mark_dirty();
+		apply_mcc_settings_for_module(module);
+	}
+	if (ImGui::Checkbox("acceleration##mouse", &s->mouse_acceleration[module])) {
+		settings_mark_dirty();
+		apply_mcc_settings_for_module(module);
+	}
+
+	ImGui::Separator();
+	ImGui::TextUnformatted("Profile toggles");
+	if (ImGui::Checkbox("hold to zoom",         &s->hold_to_zoom[module]))         { settings_mark_dirty(); apply_mcc_settings_for_module(module); }
+	if (ImGui::Checkbox("auto-center camera",   &s->auto_center_enabled[module]))  { settings_mark_dirty(); apply_mcc_settings_for_module(module); }
+	if (ImGui::Checkbox("vibration disabled",   &s->vibration_disabled[module]))   { settings_mark_dirty(); apply_mcc_settings_for_module(module); }
+	if (ImGui::Checkbox("modern aim control",   &s->use_modern_aim_control[module])){ settings_mark_dirty(); apply_mcc_settings_for_module(module); }
+	if (ImGui::Checkbox("use elite model",      &s->use_elite_model[module]))      { settings_mark_dirty(); apply_mcc_settings_for_module(module); }
+
+	ImGui::Separator();
+	if (ImGui::Button("Save")) {
+		mcc_user_settings_save();
+		s_settings_dirty = false;
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Reload from disk")) {
+		mcc_user_settings_reload();
+		s_settings_dirty = false;
+	}
+	ImGui::SameLine();
+	ImGui::TextDisabled("(also auto-saves ~0.5s after the last edit)");
+
+	// Tail-coalesce save once the user stops dragging. Cheap if not dirty.
+	settings_maybe_flush();
 }
 
 // Top strip ------------------------------------------------------------------
@@ -403,10 +507,14 @@ static void render_pause_overlay(float win_w, float win_h) {
 				ImGui::ColorConvertFloat4ToU32(col_border), 1.0f);
 
 			ImGui::SetCursorScreenPos(ImVec2(sub_x, sub_y));
+			// AlwaysVerticalScrollbar — page_settings is taller than the
+			// pause panel can fit, so a scrollbar is mandatory; without it
+			// the bottom controls (audio mute, save buttons, etc.) get
+			// clipped off the panel and the user can't reach them.
 			ImGui::BeginChild("##halox_pause_sub",
 				ImVec2(sub_w, sub_h),
 				ImGuiChildFlags_AlwaysUseWindowPadding,
-				0);
+				ImGuiWindowFlags_AlwaysVerticalScrollbar);
 			if (s_section == _pause_settings) {
 				chrome_section_header("SETTINGS");
 				page_settings();

@@ -48,6 +48,8 @@ void launcher_prop_load(s_game_prop& p) {
         else if (k == "hopper_map_variant")  p.hopper_map_variant  = atoi(v.c_str());
         else if (k == "film")                p.film                = atoi(v.c_str());
         else if (k == "game_tick")           p.game_tick           = atoi(v.c_str());
+        else if (k == "skull_flags")         p.skull_flags         = strtoull(v.c_str(), nullptr, 10);
+        else if (k == "insertion_point")     p.campaign_insertion_point = atoi(v.c_str());
     }
     // Always re-stamp the magic flags — without 0x8888 builtin_map_id is rejected.
     p.map.flags = 0x8888;
@@ -70,7 +72,9 @@ void launcher_prop_save(const s_game_prop& p) {
           << "hopper_game_variant=" << p.hopper_game_variant      << "\n"
           << "hopper_map_variant="  << p.hopper_map_variant       << "\n"
           << "film="                << p.film                     << "\n"
-          << "game_tick="           << p.game_tick                << "\n";
+          << "game_tick="           << p.game_tick                << "\n"
+          << "skull_flags="         << p.skull_flags              << "\n"
+          << "insertion_point="     << p.campaign_insertion_point << "\n";
     }
     fs::rename(tmp, launcher_prop_path(), ec);
     if (ec) {
@@ -84,7 +88,9 @@ void launcher_prop_save(const s_game_prop& p) {
               << "hopper_game_variant=" << p.hopper_game_variant      << "\n"
               << "hopper_map_variant="  << p.hopper_map_variant       << "\n"
               << "film="                << p.film                     << "\n"
-              << "game_tick="           << p.game_tick                << "\n";
+              << "game_tick="           << p.game_tick                << "\n"
+              << "skull_flags="         << p.skull_flags              << "\n"
+              << "insertion_point="     << p.campaign_insertion_point << "\n";
         }
     }
 }
@@ -97,7 +103,9 @@ bool launcher_prop_changed(const s_game_prop& a, const s_game_prop& b) {
         || a.hopper_game_variant != b.hopper_game_variant
         || a.hopper_map_variant != b.hopper_map_variant
         || a.film != b.film
-        || a.game_tick != b.game_tick;
+        || a.game_tick != b.game_tick
+        || a.skull_flags != b.skull_flags
+        || a.campaign_insertion_point != b.campaign_insertion_point;
 }
 } // namespace
 
@@ -147,6 +155,57 @@ constexpr const char* game_difficulty_names[] = {
 	"Hard",
 	"Impossible"
 };
+
+// Display names for libmcc::e_skull (parallel to the enum, indices 0..k_skull_count-1).
+// Order MUST match the enum in libmcc/game/game_options.h. Not every skull is
+// recognized by every engine — extras are silently ignored at gameplay time,
+// so it's safe to surface the full list to the user.
+struct s_skull_label {
+	const char* short_name;  // checkbox label
+	const char* desc;        // tooltip explaining the gameplay effect
+};
+constexpr s_skull_label k_skull_labels[] = {
+	{ "Anger",                    "Enemies fire faster and more aggressively." },
+	{ "Assassins",                "All enemies have active camo." },
+	{ "Bandanna",                 "Infinite ammo and grenades, no reload." },
+	{ "Black Eye",                "Shields don't recharge unless you melee enemies." },
+	{ "Blind",                    "HUD and first-person weapon are hidden." },
+	{ "Bonded Pair",              "Each AI is tethered to a partner; killing one weakens the other." },
+	{ "Boom",                     "Doubled explosion radius and force." },
+	{ "Catch",                    "Enemies throw and drop more grenades." },
+	{ "Cowbell",                  "Acceleration from explosions is increased." },
+	{ "Envy",                     "Hold the flashlight key to use active camo." },
+	{ "Eye Patch",                "Disables auto-aim assist." },
+	{ "Famine",                   "Dropped weapons have less ammo." },
+	{ "Feather",                  "Player jumps higher." },
+	{ "Fog",                      "Motion tracker is disabled." },
+	{ "Foreign",                  "Cannot use covenant weapons." },
+	{ "Ghost",                    "Allies are invulnerable." },
+	{ "Grunt Birthday Party",     "Headshots on grunts produce confetti and cheers." },
+	{ "Grunt Funeral",            "Grunts explode on death." },
+	{ "Iron",                     "Co-op: any death restarts at the last checkpoint." },
+	{ "IWHBYD",                   "Rare combat dialogue triggers more often." },
+	{ "Jacked",                   "Enemies hijack your vehicles." },
+	{ "Malfunction",              "Random HUD elements glitch off." },
+	{ "Masterblaster",            "All weapons fire explosive rounds." },
+	{ "Mythic",                   "Enemies have double health." },
+	{ "Pinata",                   "Punching enemies drops more grenades." },
+	{ "Prophet Birthday Party",   "Prophets headshot with confetti effects." },
+	{ "Recession",                "All weapons fire backward." },
+	{ "Scarab",                   "All weapons act like the Scarab cannon." },
+	{ "So Angry",                 "Enemies become enraged on damage." },
+	{ "Sputnik",                  "Object mass is reduced — explosions and melee fling things farther." },
+	{ "Streaking",                "Player movement leaves a visual trail." },
+	{ "Swarm",                    "More enemies in encounters." },
+	{ "That's Just Wrong",        "Enemies see through camo and stealth." },
+	{ "They Come Back",           "Killed enemies revive after a delay." },
+	{ "Thunderstorm",             "All enemies upgraded one rank." },
+	{ "Tilt",                     "Damage type effectiveness against shields/health flipped." },
+	{ "Tough Luck",               "Enemies always dive away from grenades and dodge fire." },
+	{ "Boots Off The Ground",     "All combat takes place in vehicles where possible." },
+};
+static_assert(sizeof(k_skull_labels) / sizeof(k_skull_labels[0]) == libmcc::k_skull_count,
+	"k_skull_labels must stay in sync with libmcc::e_skull");
 
 void c_imgui_game_view::render() {
 	if (ImGui::Begin("Game Window")) {
@@ -251,6 +310,33 @@ void c_imgui_game_mainmenu_view::render_internal() {
 				snprintf(label, sizeof(label), "%s (id=%d)", e.name, (int)e.id);
 				if (ImGui::Selectable(label, selected)) {
 					prop.map.builtin_map_id = e.id;
+					// Snap the map-variant selection to the first variant
+					// known to belong to the new map. Without this the
+					// dropdown still proudly shows an mvar from the previous
+					// map, which won't actually load.
+					auto* l = (prop.module != k_module_none)
+						? game_instance_manager()->get_game_locals(prop.module)
+						: nullptr;
+					if (l) {
+						const int legacy = find_legacy_map_id(e.id);
+						if (legacy != -1) {
+							bool current_ok = false;
+							if (prop.hopper_map_variant >= 0 &&
+								prop.hopper_map_variant < (int)l->hopper_map_variant_ids.size()) {
+								int cur_id = l->hopper_map_variant_ids[prop.hopper_map_variant];
+								current_ok = (cur_id == legacy);
+							}
+							if (!current_ok) {
+								prop.hopper_map_variant = -1;
+								for (int j = 0; j < (int)l->hopper_map_variant_ids.size(); ++j) {
+									if (l->hopper_map_variant_ids[j] == legacy) {
+										prop.hopper_map_variant = j;
+										break;
+									}
+								}
+							}
+						}
+					}
 				}
 				if (selected) ImGui::SetItemDefaultFocus();
 			}
@@ -331,6 +417,51 @@ void c_imgui_game_mainmenu_view::render_campaign() {
 		}
 		ImGui::EndCombo();
 	}
+
+	// Insertion point — engine-internal checkpoint index. 0 = mission start;
+	// non-zero jumps to a later checkpoint within the scenario. Range varies
+	// per game/level, so we expose a free-form integer rather than guess limits.
+	ImGui::InputInt("Insertion Point", &prop.campaign_insertion_point);
+	if (prop.campaign_insertion_point < 0) prop.campaign_insertion_point = 0;
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip("0 = start of mission. Higher values jump to later checkpoints in the scenario (per-game, per-level).");
+	}
+
+	// Skulls — each bit toggles one libmcc::e_skull entry on the launch
+	// game_options. Two-column layout keeps the panel compact even with the
+	// full ~38-skull list. Hidden inside a CollapsingHeader so it doesn't
+	// dominate the campaign panel for users who never touch them.
+	{
+		int active = 0;
+		for (int i = 0; i < libmcc::k_skull_count; ++i) {
+			if (prop.skull_flags & (1ull << i)) ++active;
+		}
+		char header[64];
+		// ### marker — everything AFTER ### is the stable ID; everything
+		// before is just display text. Plain ## would still hash the changing
+		// "(N active)" prefix and reset the open-state on every toggle.
+		snprintf(header, sizeof(header), "Skulls (%d active)###skulls_header", active);
+		if (ImGui::CollapsingHeader(header)) {
+			if (ImGui::SmallButton("Clear All##skulls")) prop.skull_flags = 0;
+			ImGui::SameLine();
+			ImGui::TextDisabled("Toggle gameplay modifiers — only those supported by the selected game take effect.");
+
+			ImGui::Columns(2, "skull_cols", false);
+			for (int i = 0; i < libmcc::k_skull_count; ++i) {
+				const uint64_t mask = 1ull << i;
+				bool on = (prop.skull_flags & mask) != 0;
+				ImGui::PushID(i);
+				if (ImGui::Checkbox(k_skull_labels[i].short_name, &on)) {
+					if (on) prop.skull_flags |=  mask;
+					else    prop.skull_flags &= ~mask;
+				}
+				if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", k_skull_labels[i].desc);
+				ImGui::PopID();
+				ImGui::NextColumn();
+			}
+			ImGui::Columns(1);
+		}
+	}
 }
 
 void c_imgui_game_mainmenu_view::render_multiplayer() {
@@ -375,10 +506,25 @@ void c_imgui_game_mainmenu_view::render_multiplayer() {
 	}
 
 	if (ImGui::BeginCombo("Map Variant", preview_value)) {
-		if (local)
-			for (int i = 0; i < local->hopper_map_variants.size(); ++i)
+		if (local) {
+			// mvars store the engine-internal "legacy" map id (Reflection=1150),
+			// not the libmcc enum value (Reflection=194). Translate via the
+			// table in map_names.h. -1 means we have no legacy id for this map,
+			// so the filter degrades to "show everything" instead of hiding
+			// the entire list.
+			const int sel_legacy = find_legacy_map_id(prop.map.builtin_map_id);
+			int shown = 0;
+			for (int i = 0; i < (int)local->hopper_map_variants.size(); ++i) {
+				int mvid = (i < (int)local->hopper_map_variant_ids.size())
+					? local->hopper_map_variant_ids[i] : -1;
+				if (sel_legacy != -1 && mvid != sel_legacy) continue;
 				if (ImGui::Selectable(local->hopper_map_variants[i].c_str(), prop.hopper_map_variant == i))
 					prop.hopper_map_variant = i;
+				shown++;
+			}
+			if (shown == 0)
+				ImGui::TextDisabled("No map variants for this map");
+		}
 		ImGui::EndCombo();
 	}
 }

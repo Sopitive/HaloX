@@ -17,6 +17,45 @@ static SRWLOCK g_console_lock = SRWLOCK_INIT;
 
 c_console_logger c_console_logger::g_console_logger;
 
+// Per-thread suppression flag: when non-zero, the first-chance vectored
+// exception handler returns immediately without doing a dbghelp stack walk.
+// Used by code paths that intentionally chain into native code which may AV
+// (e.g. halo1 RT vt[0x1A]/[0x1B] on partially-init RTs); the local SEH
+// __except still catches the AV — we just need the vectored handler to
+// stay silent so concurrent firings don't corrupt dbghelp state.
+static thread_local int g_exception_log_suppress_depth = 0;
+
+c_exception_log_suppressor::c_exception_log_suppressor() {
+	g_exception_log_suppress_depth++;
+}
+c_exception_log_suppressor::~c_exception_log_suppressor() {
+	g_exception_log_suppress_depth--;
+}
+bool exception_log_is_suppressed() {
+	return g_exception_log_suppress_depth > 0;
+}
+
+volatile long g_quit_cleanup_active = 0;
+
+c_quit_cleanup_guard::c_quit_cleanup_guard() {
+	InterlockedIncrement(&g_quit_cleanup_active);
+}
+c_quit_cleanup_guard::~c_quit_cleanup_guard() {
+	InterlockedDecrement(&g_quit_cleanup_active);
+}
+
+static bool addr_in_module(uintptr_t addr, const wchar_t* leafname) {
+	HMODULE m = nullptr;
+	if (!GetModuleHandleExW(
+		GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		reinterpret_cast<LPCWSTR>(addr), &m) || !m) return false;
+	wchar_t path[MAX_PATH] = { 0 };
+	if (!GetModuleFileNameW(m, path, MAX_PATH)) return false;
+	const wchar_t* leaf = wcsrchr(path, L'\\');
+	leaf = leaf ? leaf + 1 : path;
+	return _wcsicmp(leaf, leafname) == 0;
+}
+
 static void describe_address(uintptr_t addr, char* out, size_t out_size) {
 	HMODULE m = nullptr;
 	if (!GetModuleHandleExW(
@@ -199,6 +238,25 @@ static LONG WINAPI halox_unhandled_exception_filter(EXCEPTION_POINTERS* info) {
 	return EXCEPTION_EXECUTE_HANDLER;  // let the process die
 }
 
+// Returns true if the faulting thread should be redirected to ExitThread
+// instead of crashing the process. Currently triggers only during the quit-
+// cleanup window for mss64.dll AVs (Miles Sound System worker thread).
+static bool maybe_redirect_to_exit_thread(EXCEPTION_POINTERS* info) {
+	if (!info || !info->ExceptionRecord || !info->ContextRecord) return false;
+	if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return false;
+	if (!g_quit_cleanup_active) return false;
+	auto addr = reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress);
+	if (!addr_in_module(addr, L"mss64.dll")) return false;
+	console_logger()->warn(
+		"quit-cleanup: redirecting mss64.dll thread %lu RIP=0x%llX to ExitThread (AV swallowed)",
+		GetCurrentThreadId(), (uint64_t)addr);
+	console_logger()->flush();
+	auto* ctx = info->ContextRecord;
+	ctx->Rip = reinterpret_cast<DWORD64>(&ExitThread);
+	ctx->Rcx = 0;  // exit code passed to ExitThread
+	return true;
+}
+
 int c_console_logger::initialize() {
 	FILE* file;
 
@@ -257,7 +315,19 @@ int c_console_logger::initialize() {
 		default:
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
+		// Skip the dbghelp walk if a code path on this thread has marked
+		// itself as "expects to throw and recover via local __except". The
+		// process keeps running; only the first-chance log entry is dropped.
+		if (exception_log_is_suppressed()) {
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
 		halox_unhandled_exception_filter(info);
+		// During halo2 quit cleanup, mss64 worker thread AVs would otherwise
+		// kill the whole launcher. Redirect the faulting thread to ExitThread
+		// and resume from the modified context — process keeps running.
+		if (maybe_redirect_to_exit_thread(info)) {
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
 		return EXCEPTION_CONTINUE_SEARCH;  // still let SEH handlers (and the unhandled filter) run
 	});
 

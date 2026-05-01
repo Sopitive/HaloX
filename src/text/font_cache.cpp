@@ -190,11 +190,19 @@ const libmcc::s_font_character* c_font_cache::upload_h2_glyph(
 		return &result.first->second;
 	}
 
-	int left = 0, top = 0;
-	char index = m_packer.pack((short)dst_w, (short)dst_h, &left, &top);
+	// Pack with a 1px transparent gutter so bilinear sampling at glyph edges
+	// blends to the (zero-init / never-written) border instead of bleeding
+	// into adjacent packed glyphs. The reported atlas (left, top) points at
+	// the glyph content; the gutter sits outside the engine's source rect.
+	constexpr int k_glyph_padding = 1;
+	int slot_left = 0, slot_top = 0;
+	char index = m_packer.pack((short)(dst_w + 2 * k_glyph_padding),
+		(short)(dst_h + 2 * k_glyph_padding), &slot_left, &slot_top);
 	if (index < 0 || index > (char)m_sprites.size()) return nullptr;
 	if ((size_t)index == m_sprites.size())
 		m_sprites.push_back(rasterizer()->create_sprite(1024, 1024));
+	int left = slot_left + k_glyph_padding;
+	int top  = slot_top  + k_glyph_padding;
 
 	auto sprite_index = m_sprites[index];
 	auto sprite = rasterizer()->get_sprite(sprite_index);
@@ -582,11 +590,17 @@ const libmcc::s_font_character* c_font_cache::precache_character(
 	}
 
 	auto bitmap = &glyph->bitmap;
-	int left, top;
 	short width = bitmap->width;
 	short height = bitmap->rows;
 
-	char index = m_packer.pack(width, height, &left, &top);
+	// Pack with a 1px transparent gutter so bilinear sampling at glyph edges
+	// blends to the (zero-init / never-written) border instead of bleeding
+	// into adjacent packed glyphs. The reported atlas (left, top) points at
+	// the glyph content; the gutter sits outside the engine's source rect.
+	constexpr int k_glyph_padding = 1;
+	int slot_left = 0, slot_top = 0;
+	char index = m_packer.pack(width + 2 * k_glyph_padding,
+		height + 2 * k_glyph_padding, &slot_left, &slot_top);
 
 	if (index < 0 || index > m_sprites.size()) {
 		return nullptr;
@@ -595,6 +609,9 @@ const libmcc::s_font_character* c_font_cache::precache_character(
 	if (index == m_sprites.size()) {
 		m_sprites.push_back(rasterizer()->create_sprite(1024, 1024));
 	}
+
+	int left = slot_left + k_glyph_padding;
+	int top  = slot_top  + k_glyph_padding;
 
 	auto sprite_index = m_sprites[index];
 

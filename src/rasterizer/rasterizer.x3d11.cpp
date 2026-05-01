@@ -2,6 +2,7 @@
 
 #include <array>
 #include "../logging/logging.h"
+#include "../game/mcc_user_settings.h"
 
 int c_rasterizer::initialize_device() {
 	UINT flags;
@@ -137,7 +138,10 @@ int c_rasterizer::begin_frame_device() {
 
 int c_rasterizer::end_frame_device() {
 	if (g_win32_parameter.window_thread == GetCurrentThreadId()) {
-		m_dxgi_swap_chain->Present(1, 0);
+		// VSync from MCC's GameUserSettings.ini bUseVSync. Default true if
+		// unset/unparsed (matches the prior hardcoded `Present(1, 0)`).
+		const UINT sync_interval = mcc_user_settings()->graphics.use_vsync ? 1u : 0u;
+		m_dxgi_swap_chain->Present(sync_interval, 0);
 	}
 	return 0;
 }

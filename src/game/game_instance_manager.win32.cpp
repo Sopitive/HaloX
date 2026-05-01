@@ -282,10 +282,34 @@ LRESULT c_game_instance_manager::process_message(
 			return 0;
 		}
 
-		if (uMsg == _window_message_game_restart) {
+		// Arm the quit-cleanup window. While the counter is non-zero, mss64.dll
+		// AVs (Miles Sound System worker thread tripping over torn-down halo2
+		// state) are redirected to ExitThread instead of killing the launcher.
+		// Stays armed through the silence_audio + TerminateThread + module
+		// cycle sequence, plus an extra moment afterwards for in-flight worker
+		// callbacks to drain. Raw Interlocked* (not the RAII guard) because
+		// this function uses __try, and MSVC forbids C++ object unwinding in
+		// SEH functions (C2712).
+		InterlockedIncrement(&g_quit_cleanup_active);
+
+		// Two flavors of game-end:
+		//   1. ENGINE-INITIATED (_window_message_game_restart): engine called
+		//      restart_game() because the round/match/mission ended or the
+		//      user hit the in-game quit button and the engine is now
+		//      running its outro (fade-out, credits, "you died" screen,
+		//      end-of-mission cinematic). The engine knows what it's doing;
+		//      we shouldn't post quit (which short-circuits the outro) and
+		//      shouldn't silence audio. We wait long enough for the outro
+		//      to finish naturally.
+		//   2. USER-INITIATED (WM_CLOSE / _window_message_game_quit): halox
+		//      window closed or the launcher invoked quit directly. Engine
+		//      doesn't know yet; post quit to it, silence audio, fast wait.
+		const bool engine_initiated = (uMsg == _window_message_game_restart);
+		const DWORD wait_ms = engine_initiated ? 15000 : 2000;
+
+		if (engine_initiated) {
 			auto reason = static_cast<e_game_restart_reason>(wParam);
 			auto message = reinterpret_cast<const char*>(lParam);
-
 			CONSOLE_LOG_DEBUG("GAME QUIT[%d]: %s", reason, message);
 		} else {
 			// Send the engine's quit/resume messages, BUT defensively — older
@@ -298,26 +322,26 @@ LRESULT c_game_instance_manager::process_message(
 				CONSOLE_LOG_WARN("game_quit: post_message raised SEH 0x%08lX (proceeding to thread teardown)",
 					GetExceptionCode());
 			}
+
+			// Halo2 keeps audio threads ticking after we kill the game thread —
+			// silence them BEFORE the wait so the menu doesn't get a tail of
+			// in-game music/sfx. Skipped on engine-initiated paths so the
+			// outro audio plays. No-op for other modules.
+			__try {
+				halo2_silence_audio();
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				CONSOLE_LOG_WARN("game_quit: halo2_silence_audio raised SEH 0x%08lX",
+					GetExceptionCode());
+			}
 		}
 
-		// Halo2 keeps audio threads ticking after we kill the game thread —
-		// silence them BEFORE the wait so the menu doesn't get a 2s tail of
-		// in-game music/sfx. No-op for other modules.
-		__try {
-			halo2_silence_audio();
-		} __except (EXCEPTION_EXECUTE_HANDLER) {
-			CONSOLE_LOG_WARN("game_quit: halo2_silence_audio raised SEH 0x%08lX",
-				GetExceptionCode());
-		}
-
-		// Bounded wait — older ABI games may not actually exit on quit
-		// post_message (it crashed inside their handler), so spin-waiting
-		// forever (the original behavior) froze the entire window. Wait at
-		// most 2s for graceful exit, then force-terminate.
-		const DWORD wait_rc = WaitForSingleObject(m_game_thread, 2000);
+		// Bounded wait. Long for engine-initiated outros (so we don't kill
+		// the engine mid-cinematic and snap the user to the launcher);
+		// short for user-quit (snappy response).
+		const DWORD wait_rc = WaitForSingleObject(m_game_thread, wait_ms);
 		if (wait_rc != WAIT_OBJECT_0) {
-			CONSOLE_LOG_WARN("game_quit: game thread didn't exit within 2s "
-				"(rc=0x%lX) — forcing TerminateThread", wait_rc);
+			CONSOLE_LOG_WARN("game_quit: game thread didn't exit within %lums "
+				"(rc=0x%lX) — forcing TerminateThread", wait_ms, wait_rc);
 			TerminateThread(m_game_thread, 0);
 			// Give Windows a moment to actually clean up the thread.
 			WaitForSingleObject(m_game_thread, 500);
@@ -336,6 +360,19 @@ LRESULT c_game_instance_manager::process_message(
 					GetExceptionCode());
 			}
 			m_game_engine = nullptr;
+		}
+
+		// Per-game pre-unload cleanup. Hooks installed by halox into the game
+		// DLL must be removed BEFORE FreeLibrary unmaps the target bytes —
+		// otherwise MH_RemoveHook on the next launch would touch freed memory
+		// (or the next install bails on stale g_hooked_module bookkeeping).
+		if (m_game == _module_halo2) {
+			__try {
+				halo2_uninstall_input_hooks();
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				CONSOLE_LOG_WARN("game_quit: halo2_uninstall_input_hooks raised SEH 0x%08lX",
+					GetExceptionCode());
+			}
 		}
 
 		// Cycle the game's DLL: unload + reload. m_game_engine->free()
@@ -362,6 +399,11 @@ LRESULT c_game_instance_manager::process_message(
 		InterlockedExchange(&g_show_imgui, TRUE);
 		// Release any cursor capture so the user can click the launcher.
 		apply_cursor_capture(hWnd, false);
+
+		// Disarm the quit-cleanup window. Pair with the InterlockedIncrement
+		// at the top of this case. After this point, mss64.dll AVs once again
+		// kill the process (preserving real-bug visibility outside quit).
+		InterlockedDecrement(&g_quit_cleanup_active);
 
 		return 0;
 	}

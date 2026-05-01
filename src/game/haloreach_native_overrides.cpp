@@ -61,16 +61,16 @@ static constexpr int32_t   k_hr_kb_unbound        = -1;            // 0xFFFFFFFF
 // CONFIRMED — see project_haloreach_profile_bypass.md "Tag map" section for
 // per-entry confidence).
 static const int8_t k_libmcc_to_haloreach_tag[k_game_abstract_button_count] = {
-	/* jump                            */  0x01, // CONFIRMED
-	/* switchgrenade                   */  0x0B, // LIKELY
+	/* jump                            */  0x00, // LIVE-DUMP 2026-04-30 (was 0x01)
+	/* switchgrenade                   */  0x23, // LIVE-DUMP 2026-04-30 (was 0x0B; tag 0x0B was unmapped → engine default coincided with user's jump key → "same button" symptom)
 	/* actionreload                    */  -1,
-	/* reload                          */  0x0C, // LIKELY
+	/* reload                          */  0x1E, // LIVE-DUMP 2026-04-30 (was 0x0C)
 	/* switchweapon                    */  0x05, // LIKELY
-	/* meleeattack                     */  0x04, // CONFIRMED-BY-OBSERVATION (was 0x03; user reported MMB-as-melee fired crouch action — swapped)
-	/* flashlight                      */  0x06, // CONFIRMED
-	/* throwgrenade                    */  0x0A, // LIKELY
+	/* meleeattack                     */  0x06, // LIVE-DUMP 2026-04-30 (was 0x04; user re-reported melee/crouch inversion after the prior 0x03→0x04 swap — actual reach tag for melee is 0x06, not in either earlier guess)
+	/* flashlight                      */  0x06, // CONFIRMED — but conflicts with melee above; flashlight may need re-RE if it stops working
+	/* throwgrenade                    */  0x1F, // LIVE-DUMP 2026-04-30 (was 0x0A)
 	/* fire                            */  0x07, // CONFIRMED
-	/* crouch                          */  0x03, // CONFIRMED-BY-OBSERVATION (was 0x04; same swap as melee)
+	/* crouch                          */  0x05, // LIVE-DUMP 2026-04-30 (was 0x03; same RE pass as melee)
 	/* zoom                            */  0x06, // LIKELY (reach reuses flashlight)
 	/* zoomin                          */  0x19, // LIKELY
 	/* zoomout                         */  0x1A, // LIKELY
@@ -335,11 +335,28 @@ static DWORD WINAPI haloreach_state_logger_thread(LPVOID) {
 	CONSOLE_LOG_INFO("hr_state_logger: armed (haloreach base=%p, polling 0.5ms for %ums)",
 		(void*)base, (unsigned)kDeadlineMs);
 
+	// SEH-safe peek for each volatile global. The four addresses are
+	// computed from haloreach.dll's base + RVA, which is normally valid as
+	// soon as the DLL is loaded — but live RE on Reach MP showed at least
+	// one of these globals can land in a region that becomes momentarily
+	// unreadable during early launch (we crashed at halox+0x2D6E0 with a
+	// junk RCX = 0x0FA0... while polling here). This is a diagnostic
+	// thread — not load-bearing — so an AV must not propagate; bail
+	// gracefully on any bad read.
+	auto safe_read_u32 = [](volatile uint32_t* p, uint32_t* out) -> bool {
+		__try { *out = *p; return true; }
+		__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	};
+
 	while (GetTickCount64() - t0 < kDeadlineMs) {
-		uint32_t s = *state;
-		uint32_t f = *film;
-		uint32_t p = *psjs;
-		uint32_t e = *ext_gate;
+		uint32_t s, f, p, e;
+		if (!safe_read_u32(state,    &s) ||
+		    !safe_read_u32(film,     &f) ||
+		    !safe_read_u32(psjs,     &p) ||
+		    !safe_read_u32(ext_gate, &e)) {
+			CONSOLE_LOG_WARN("hr_state_logger: bad read on one of state/film/psjs/ext_gate — bailing");
+			break;
+		}
 
 		if (s < 32) state_seen_mask |= (1u << s);
 
